@@ -39,10 +39,11 @@ def tap_body(text, addr, imports):
     lines[0] = "static void tap_%08X(Cpu* __restrict c) {" % addr
     out = []
     for ln in lines:
-        ln = re.sub(r"MUSTTAIL return f_([0-9A-F]{8})(?:_orig)?\(c\);", lambda m: "{ tap_call(c, f_%s, 0x%sU); return; }" % (m.group(1), m.group(1)), ln)
-        ln = re.sub(r"(?<![\w>])f_([0-9A-F]{8})\(c\);", lambda m: "tap_call(c, f_%s, 0x%sU);" % (m.group(1), m.group(1)), ln)
+        ln = re.sub(r"MUSTTAIL return f_([0-9A-F]{8})(_orig|_abi|_sync)?\(c\);", lambda m: "{ tap_call(c, f_%s%s, 0x%sU); return; }" % (m[1], m[2] or "", m[1]), ln)
+        ln = re.sub(r"(?<![\w>])f_([0-9A-F]{8})(_abi|_sync)?\(c\);", lambda m: "tap_call(c, f_%s%s, 0x%sU);" % (m[1], m[2] or "", m[1]), ln)
         ln = ln.replace("MUSTTAIL return ppc_dispatch(c);", "{ tap_dispatch(c); return; }")
         ln = re.sub(r"(?<![\w>])ppc_dispatch\(c\);", "tap_dispatch(c);", ln)
+        ln = re.sub(r"ppc_dispatch_cached\(c, &ic_[0-9A-F]{8}\);", "tap_dispatch(c);", ln)
         ln = re.sub(r"MUSTTAIL return (imp_\w+)\(c\);", lambda m: "{ tap_call(c, %s, 0x%08XU); return; }" % (m.group(1), imports.get(m.group(1), 0)), ln)
         ln = re.sub(r"(?<![\w>])(imp_\w+)\(c\);", lambda m: "tap_call(c, %s, 0x%08XU);" % (m.group(1), imports.get(m.group(1), 0)), ln)
         out.append(ln)

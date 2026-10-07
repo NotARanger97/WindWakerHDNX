@@ -67,11 +67,9 @@ void pull(int16_t* out,uint32_t frames) {
     uint32_t r = g_read.load(std::memory_order_relaxed), w = g_write.load(std::memory_order_acquire);
     if (g_flush.exchange(false)) r = w;
     uint32_t avail = w - r, n = std::min<uint32_t>(avail, frames);
-    for (uint32_t i = 0; i < n; i++) {
-        uint32_t idx = (r + i) & (kCapacity - 1);
-        out[i * 2] = g_ring[idx * 2];
-        out[i * 2 + 1] = g_ring[idx * 2 + 1];
-    }
+    const uint32_t at = r & (kCapacity - 1), first = std::min<uint32_t>(n, kCapacity - at);
+    memcpy(out, g_ring + at * 2, first * 4);
+    memcpy(out + first * 2, g_ring, (n - first) * 4);
     if (n < frames) {  // underrun: silence
         memset(out + n * 2, 0, (frames - n) * 4);
         g_underrun += frames - n;
@@ -159,11 +157,9 @@ void push(const int16_t* stereo, int frames) {
         g_dropped += frames;
         return;
     }
-    for (int i = 0; i < frames; i++) {
-        uint32_t idx = (w + i) & (kCapacity - 1);
-        g_ring[idx * 2] = stereo[i * 2];
-        g_ring[idx * 2 + 1] = stereo[i * 2 + 1];
-    }
+    const uint32_t at = w & (kCapacity - 1), first = std::min<uint32_t>(frames, kCapacity - at);
+    memcpy(g_ring + at * 2, stereo, first * 4);
+    memcpy(g_ring, stereo + first * 2, (frames - first) * 4);
     g_write.store(w + frames, std::memory_order_release);
 }
 

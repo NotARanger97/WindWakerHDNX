@@ -52,6 +52,11 @@ public:
       }
     }
     auto slice = std::forward<Factory>(factory)(bytes, size);
+    // Upload arenas may fall back to uncached memory on Switch. Never retain
+    // those slices for mapped comparisons; CPU-only fixture slices need no flag.
+    if constexpr (requires { slice.cpuReadable; }) {
+      if (!slice.cpuReadable) { last = {}; return slice; }
+    }
     // Failed/empty factories never publish an entry whose mapped pointer could
     // be dereferenced. Allocation padding is not compared as guest memory.
     if (slice.buffer && slice.mapped && slice.size == (size < 16 ? 16 : size))

@@ -39,6 +39,9 @@ enum Op : uint32_t {
     // aspect ratio (aspect.cpp), appended to keep the numbers of recorded display lists
     OP_SET_PROJ_REGS,   // first register, 16 values: a layout projection matrix (narrowed when drawing to the TV)
     OP_LAYOUT_ROOT,     // nw::lyt root pane: drawn into the target bound now (which screen it goes to)
+    // host-only, Switch GX2 front end -> render thread (gx2_core.cpp)
+    OP_RAW_REGS,        // first register, values: store only (the front end classified the change)
+    OP_GEN_BUMPS,       // flags, texture slot bits lo/hi, sampler slot bits lo/hi: draw-state generations to bump
     OP_COUNT
 };
 

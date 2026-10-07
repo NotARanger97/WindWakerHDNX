@@ -7,21 +7,22 @@ import os
 import pickle
 import re
 
-FUNC_RE = re.compile(r"^void (f_[0-9A-F]{8}(?:_orig)?)\(Cpu\* __restrict c\) \{$")
-CALL_RE = re.compile(r"\bf_([0-9A-F]{8})(_orig)?\(c\)")
+FUNC_RE = re.compile(r"^void (f_[0-9A-F]{8}(?:_orig|_abi|_sync)?)\(Cpu\* __restrict c\) \{$")
+CALL_RE = re.compile(r"\bf_([0-9A-F]{8})(_orig|_abi|_sync)?\(c\)")
 INT_ARGS = tuple(range(3, 11))
 FLT_ARGS = tuple(range(1, 9))
 
 
 class GenIndex:
-    """address -> generated C text of that function (the game's code: f_X, or f_X_orig if hooked)"""
+    """address -> generated guest body (normal, original or fast entry)."""
 
     def __init__(self, gen_dir, cache=None):
         self.gen_dir = gen_dir
         cache = cache or os.path.join(gen_dir, "..", "verify", "genindex.pkl")
         stamp = max(os.path.getmtime(os.path.join(gen_dir, f)) for f in os.listdir(gen_dir) if f.startswith("code_"))
         if os.path.exists(cache) and os.path.getmtime(cache) > stamp:
-            self.loc = pickle.load(open(cache, "rb"))
+            with open(cache, "rb") as f:
+                self.loc = pickle.load(f)
         else:
             self.loc = {}
             for fn in sorted(os.listdir(gen_dir)):
@@ -45,7 +46,8 @@ class GenIndex:
                             start = None
                         off += len(line)
             os.makedirs(os.path.dirname(cache), exist_ok=True)
-            pickle.dump(self.loc, open(cache, "wb"))
+            with open(cache, "wb") as f:
+                pickle.dump(self.loc, f)
         self.addrs = sorted(self.loc)
         self._text = {}
 
@@ -297,7 +299,8 @@ class Cfg:
                     pd.add(("f", int(m.group(1))))
                 d |= pd
             self.calls.append([int(cm.group(1), 16) for cm in CALL_RE.finditer(s)])
-            self.indirect.append("ppc_dispatch(c)" in s or bool(re.search(r"\bimp_\w+\(c\)", s)))
+            self.indirect.append("ppc_dispatch(c)" in s or "ppc_dispatch_cached(c," in s or
+                                 bool(re.search(r"\bimp_\w+\(c\)", s)))
             nx = []
             for gm in re.finditer(r"goto L_([0-9A-F]{8})", s):
                 t = int(gm.group(1), 16)

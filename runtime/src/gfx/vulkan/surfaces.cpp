@@ -4,12 +4,19 @@
 #include "settings.h"
 #include "sparse_hash_memo.h"
 #include "write_watch.h"
+#include "address_range_index.h"
+#include "draw_options.h"
 #define XXH_INLINE_ALL
 #include "../../../third_party/xxhash/xxhash.h"
 #include "Cafe/HW/Latte/ISA/LatteReg.h"
 #include "Cafe/HW/Latte/ISA/RegDefines.h"
 #include "Cafe/HW/Latte/LatteAddrLib/LatteAddrLib.h"
+#include "tile_walk.h"
 #include "gx2/gx2.h"
+#include "shaders.h"
+#ifdef __SWITCH__
+#include "gx2/shader_program_writes.h"
+#endif
 #include "gx2_texture_regs.h"
 #include "runtime.h"
 #include <algorithm>
@@ -22,24 +29,24 @@
 #include <stdexcept>
 #include <string>
 #include <tuple>
+#include <unordered_set>
 
 Latte::E_GX2SURFFMT LatteTexture_ReconstructGX2Format(const Latte::LATTE_SQ_TEX_RESOURCE_WORD1_N&, const Latte::LATTE_SQ_TEX_RESOURCE_WORD4_N&);
 namespace gfxvk {
+// Queued payloads are uint32 words. These guest structs need no stronger alignment.
+static_assert(alignof(GX2::GX2ColorBuffer) <= alignof(uint32_t));
+static_assert(alignof(GX2::GX2DepthBuffer) <= alignof(uint32_t));
+static_assert(alignof(GX2Surface) <= alignof(uint32_t));
 // Guest layout is immutable between descriptor changes. Invalidation ranges,
 // sparse checks and uploads share this metadata; image scale/layout are unrelated.
 struct CachedGuestLevel {
     LatteAddrLib::AddrSurfaceInfo_OUT info{};
     uint32_t address = 0;
     bool infoValid = false, addressValid = false;
-    uint64_t rangeBegin = 0, rangeEnd = 0;
-    bool rangeValid = false;
 };
 struct CachedGuestLayout {
     std::array<uint32_t, 10> descriptor{};
     std::vector<CachedGuestLevel> levels;
-    uint64_t mipRangeBegin = UINT64_MAX, mipRangeEnd = 0;
-    uint32_t mipRangesCached = 0;
-    bool mipRangesComplete = false;
 };
 static CachedGuestLevel& guest_level(const Surface* s, uint32_t level) {
     std::array<uint32_t, 10> descriptor{s->addr,s->mipAddr,s->width,s->height,s->slices,
@@ -204,6 +211,7 @@ Surface* depth_target(const uint32_t* regs, uint32_t* slice) {
     d.height = wh ? (wh & 0xFFFF) : height;
     d.pitch = pitch;
     d.format = fmts[info & 7];
+    d.tileMode = (info >> 15) & 0xF;
     d.isDepth = true;
     d.slices = slices;
     d.dim = slices > 1 ? kDim2DArray : kDim2D;
@@ -211,7 +219,10 @@ Surface* depth_target(const uint32_t* regs, uint32_t* slice) {
 }
 
 Surface* surface_from_color_buffer(uint32_t addr, uint32_t* firstSlice, uint32_t* numSlices) {
-    auto* cb = (GX2::GX2ColorBuffer*)mem::ptr(addr);
+    return surface_from_color_payload(mem::ptr(addr), firstSlice, numSlices);
+}
+Surface* surface_from_color_payload(const void* payload, uint32_t* firstSlice, uint32_t* numSlices) {
+    auto* cb = static_cast<const GX2::GX2ColorBuffer*>(payload);
     SurfaceDesc d;
     uint32_t slices = cb->surface.dim.value() == Latte::E_DIM::DIM_2D_ARRAY ? std::max<uint32_t>(cb->surface.depth, 1) : 1;
     d.slices = slices;
@@ -228,7 +239,10 @@ Surface* surface_from_color_buffer(uint32_t addr, uint32_t* firstSlice, uint32_t
 }
 
 Surface* surface_from_depth_buffer(uint32_t addr, uint32_t* firstSlice, uint32_t* numSlices) {
-    auto* db = (GX2::GX2DepthBuffer*)mem::ptr(addr);
+    return surface_from_depth_payload(mem::ptr(addr), firstSlice, numSlices);
+}
+Surface* surface_from_depth_payload(const void* payload, uint32_t* firstSlice, uint32_t* numSlices) {
+    auto* db = static_cast<const GX2::GX2DepthBuffer*>(payload);
     SurfaceDesc d;
     uint32_t slices = db->surface.dim.value() == Latte::E_DIM::DIM_2D_ARRAY ? std::max<uint32_t>(db->surface.depth, 1) : 1;
     d.slices = slices;
@@ -248,6 +262,7 @@ Surface* surface_from_depth_buffer(uint32_t addr, uint32_t* firstSlice, uint32_t
 // ---------------------------------------------------------------- sampled textures
 static uint64_t sparse_hash(Surface* s);
 uint64_t g_stat_full_checks, g_stat_uploads, g_stat_invalidates, g_stat_invalidated_surfaces;
+uint64_t g_upload_ns, g_full_check_ns;  // CPU time of full texture checks and uploads (slow-frame log)
 
 Surface* sampled_texture(const uint32_t* w, bool isDepthSampler) {
     Latte::LATTE_SQ_TEX_RESOURCE_WORD0_N w0;
@@ -318,8 +333,40 @@ static void decode_level(Surface* s, uint32_t level, uint32_t base, std::vector<
     uint32_t pipeSwizzle = (s->swizzle >> 8) & 1, bankSwizzle = (s->swizzle >> 9) & 3;
     // small mips of macro-tiled surfaces drop the swizzle
     out.assign((size_t)bw * bh * slices * f.hostBytesPerBlock, 0);
-    std::vector<uint8_t> row(bw * f.bytesPerBlock);
     const uint8_t* src = mem::ptr(base);
+    // micro-tile walk (tile_walk.h): one address computation per 8x8 elements
+    {
+        const uint32_t B = f.bytesPerBlock;
+        auto copy = [B](uint8_t* d, const uint8_t* s) {
+            switch (B) {
+            case 1: *d = *s; break;
+            case 2: memcpy(d, s, 2); break;
+            case 4: memcpy(d, s, 4); break;
+            case 8: memcpy(d, s, 8); break;
+            case 16: memcpy(d, s, 16); break;
+            default: memcpy(d, s, B); break;
+            }
+        };
+        const bool direct = f.convert == Convert::NONE && f.hostBytesPerBlock == B;
+        std::vector<uint8_t> linear(direct ? 0 : (size_t)bw * bh * B);
+        bool walked = true;
+        for (uint32_t z = 0; z < slices && walked; z++) {
+            uint8_t* dst = direct ? out.data() + (size_t)z * bh * bw * B : linear.data();
+            walked = walk_tiled_slice(bw, bh, z, bpp, pitch, height, slices, tm, depthData, pipeSwizzle, bankSwizzle,
+                                      [&](uint32_t x, uint32_t y, uint32_t off) {
+                                          copy(dst + ((size_t)y * bw + x) * B, src + off);
+                                      });
+            if (walked && !direct)
+                for (uint32_t y = 0; y < bh; y++) {
+                    uint8_t* row = &out[((size_t)z * bh + y) * bw * f.hostBytesPerBlock];
+                    const uint8_t* in = linear.data() + (size_t)y * bw * B;
+                    if (f.convert == Convert::NONE) memcpy(row, in, (size_t)bw * B);
+                    else convert_row(f.convert, in, row, bw);
+                }
+        }
+        if (walked) return;
+    }
+    std::vector<uint8_t> row(bw * f.bytesPerBlock);
     for (uint32_t z = 0; z < slices; z++) {
         LatteAddrLib::CachedSurfaceAddrInfo ci;
         bool macro = Latte::TM_IsMacroTiled(tm);
@@ -419,7 +466,7 @@ static uint64_t sparse_hash(Surface* s) {
 }
 
 
-static uint32_t level_address(GX2Surface* s, uint32_t level) {
+static uint32_t level_address(const GX2Surface* s, uint32_t level) {
     if (level == 0) return s->imagePtr;
     if (level == 1) return s->mipPtr;
     return s->mipPtr + s->mipOffset[level - 1];
@@ -438,6 +485,56 @@ static uint32_t element_offset(const LatteAddrLib::AddrSurfaceInfo_OUT& info, La
 } // namespace gfxvk
 
 namespace gfxvk {
+namespace {
+bool surface_pool_enabled() {
+    static const bool enabled = draw_option_enabled("WWHD_VK_SURFACE_IMAGE_POOL");
+    return enabled;
+}
+SurfaceImageKey image_key(const Surface& s) {
+    const bool cube = s.viewType == VK_IMAGE_VIEW_TYPE_CUBE || s.viewType == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY;
+    return {s.fmt.pixel,s.extent,s.mips,s.arrayLayers,s.usage,s.imageType,
+        VkImageCreateFlags(VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | (cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0))};
+}
+void free_surface_allocation(const Renderer::RetiredImage& image) {
+    if(image.image) {
+        vkDestroyImage(R.device,image.image,nullptr);
+        if(image.key.format != VK_FORMAT_UNDEFINED) ++R.surfaceImageDestroys;
+    }
+    if(image.memory) vkFreeMemory(R.device,image.memory,nullptr);
+}
+void evict_pooled_image(size_t index) {
+    auto& image = R.surfaceImagePool[index];
+    R.surfaceImagePoolBytes -= image.allocationBytes;
+    free_surface_allocation(image);
+    R.surfaceImagePool.erase(R.surfaceImagePool.begin() + index);
+}
+}
+void recycle_surface_image(Renderer::RetiredImage image) {
+    // Called only after this submission's fence: it also covers all earlier
+    // uses on our single queue. Views/descriptors never survive pool admission.
+    for(auto view : image.views) if(view) vkDestroyImageView(R.device,view,nullptr);
+    image.views.clear();
+    constexpr VkDeviceSize budget = 64ull << 20;
+    constexpr size_t maxImages = 32, maxPerKey = 4;
+    if(!surface_pool_enabled() || !image.image || !image.memory || !image.allocationBytes ||
+       image.key.format == VK_FORMAT_UNDEFINED || image.allocationBytes > budget) {
+        free_surface_allocation(image);return;
+    }
+    size_t matches = 0, oldest = 0;
+    for(size_t i=0;i<R.surfaceImagePool.size();++i) if(R.surfaceImagePool[i].key == image.key) {
+        if(!matches) oldest=i;
+        ++matches;
+    }
+    if(matches >= maxPerKey) evict_pooled_image(oldest);
+    while(!R.surfaceImagePool.empty() && (R.surfaceImagePool.size() >= maxImages ||
+        R.surfaceImagePoolBytes > budget - image.allocationBytes)) evict_pooled_image(0);
+    R.surfaceImagePoolBytes += image.allocationBytes;
+    R.surfaceImagePool.push_back(std::move(image));
+}
+void reset_surface_image_pool() {
+    for(auto& image : R.surfaceImagePool) free_surface_allocation(image);
+    R.surfaceImagePool.clear();R.surfaceImagePoolBytes=0;
+}
 void create_surface_image(Surface* s, bool forRendering, VkExtent3D explicitExtent) {
     if (!s || !s->width || !s->height || !s->slices || !s->mips)
         throw std::runtime_error("Vulkan surface has empty dimensions");
@@ -489,32 +586,48 @@ void create_surface_image(Surface* s, bool forRendering, VkExtent3D explicitExte
     imageInfo.tiling=VK_IMAGE_TILING_OPTIMAL;imageInfo.usage=usage;s->usage=usage;imageInfo.sharingMode=VK_SHARING_MODE_EXCLUSIVE;
     imageInfo.initialLayout=VK_IMAGE_LAYOUT_UNDEFINED;
     try {
-        check_vk(vkCreateImage(R.device,&imageInfo,nullptr,&s->image),"create image");
-        VkMemoryRequirements needs{};vkGetImageMemoryRequirements(R.device,s->image,&needs);
-        VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};allocation.allocationSize=needs.size;
-        allocation.memoryTypeIndex=memory_type(needs.memoryTypeBits,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        check_vk(vkAllocateMemory(R.device,&allocation,nullptr,&s->memory),"allocate image memory");
-        check_vk(vkBindImageMemory(R.device,s->image,s->memory,0),"bind image memory");
+        const auto key = image_key(*s);
+        auto pooled = std::find_if(R.surfaceImagePool.begin(),R.surfaceImagePool.end(),
+            [&](const auto& image) { return image.key == key; });
+        if(pooled != R.surfaceImagePool.end()) {
+            s->image=pooled->image;s->memory=pooled->memory;s->allocationBytes=pooled->allocationBytes;
+            R.surfaceImagePoolBytes -= pooled->allocationBytes;
+            R.surfaceImagePool.erase(pooled);++R.surfaceImagePoolHits;
+        } else {
+            check_vk(vkCreateImage(R.device,&imageInfo,nullptr,&s->image),"create image");
+            ++R.surfaceImageCreates;
+            VkMemoryRequirements needs{};vkGetImageMemoryRequirements(R.device,s->image,&needs);
+            VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};allocation.allocationSize=needs.size;
+            allocation.memoryTypeIndex=memory_type(needs.memoryTypeBits,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            check_vk(vkAllocateMemory(R.device,&allocation,nullptr,&s->memory),"allocate image memory");
+            check_vk(vkBindImageMemory(R.device,s->image,s->memory,0),"bind image memory");
+            s->allocationBytes=needs.size;
+        }
         VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};viewInfo.image=s->image;
         viewInfo.viewType=s->viewType;viewInfo.format=s->fmt.pixel;
         viewInfo.subresourceRange={VkImageAspectFlags(s->fmt.depth?VK_IMAGE_ASPECT_DEPTH_BIT:VK_IMAGE_ASPECT_COLOR_BIT),0,s->mips,0,s->arrayLayers};
         check_vk(vkCreateImageView(R.device,&viewInfo,nullptr,&s->view),"create sampling image view");
+        // Pool entries have no guest content identity. Discard all old texels;
+        // the caller uploads, copies, clears or renders just as for a new image.
         s->layout=VK_IMAGE_LAYOUT_UNDEFINED;
     } catch(...) {
         if(s->view)vkDestroyImageView(R.device,s->view,nullptr);
-        if(s->image)vkDestroyImage(R.device,s->image,nullptr);
+        if(s->image){vkDestroyImage(R.device,s->image,nullptr);++R.surfaceImageDestroys;}
         if(s->memory)vkFreeMemory(R.device,s->memory,nullptr);
         s->view=VK_NULL_HANDLE;s->image=VK_NULL_HANDLE;s->memory=VK_NULL_HANDLE;
+        s->allocationBytes=0;
         throw;
     }
 }
 void destroy_surface_image(Surface* s) {
     if(!s||!s->image)return;
+    ++R.surfaceEpoch;++R.viewEpoch;
     auto views=std::move(s->layerViews);if(s->view)views.push_back(s->view);
     for(auto& [key,view]:s->sampledViews)if(view)views.push_back(view);s->sampledViews.clear();
-    defer_surface_image(s->image,s->memory,std::move(views));
+    defer_surface_image(s->image,s->memory,std::move(views),image_key(*s),s->allocationBytes);
     s->image=VK_NULL_HANDLE;s->memory=VK_NULL_HANDLE;s->view=VK_NULL_HANDLE;s->layout=VK_IMAGE_LAYOUT_UNDEFINED;
     s->layerViews.clear();
+    s->allocationBytes=0;
 }
 VkImageView layer_view(Surface* s,uint32_t layer) {
     if(!s||!s->image||layer>=s->arrayLayers)throw std::runtime_error("Vulkan attachment layer is out of range");
@@ -602,12 +715,39 @@ static Surface* rescale(Surface* s) {
     catch(...) { destroy_surface_image(&replacement);throw; }
     destroy_surface_image(s);
     s->image=replacement.image;s->memory=replacement.memory;s->view=replacement.view;
+    s->allocationBytes=replacement.allocationBytes;
     s->extent=replacement.extent;s->layout=replacement.layout;s->usage=replacement.usage;s->scale=replacement.scale;s->ax=replacement.ax;s->ay=replacement.ay;s->sx=replacement.sx;s->sy=replacement.sy;
     forget_texture_views();return s;
 }
-Surface* find_or_create_surface(const SurfaceDesc& d,bool forRendering) {
+Surface* find_or_create_surface(const SurfaceDesc& descriptor,bool forRendering) {
+    SurfaceDesc d = descriptor;
+    d.width=std::max(d.width,1u);d.height=std::max(d.height,1u);d.slices=std::max(d.slices,1u);
+    d.mips=forRendering?1:std::max(d.mips,1u);
+    if(forRendering)d.mipAddr=0;
     if(!d.addr)return nullptr;
+    // Macro-tiled register addresses include the same swizzle bits that the
+    // texture descriptor decodes separately. All owners use the real base.
+    if(Latte::TM_IsMacroTiled(static_cast<Latte::E_HWTILEMODE>(d.tileMode))) {
+        d.swizzle |= d.addr & 0x700;
+        d.addr &= ~0x700u;
+    }
+    // Memo of lookups that found exactly one surface at the address. R.surfaces only grows, so
+    // while nothing was inserted (surfaceInserts) the range is still that one surface, and the
+    // selection below depends only on its gpuWritten flag, checked on every hit.
+    struct Memo { SurfaceDesc d; bool forRendering; bool gpuWritten; uint64_t inserts; Surface* s; };
+    static std::array<Memo, 128> memos{};
+    static uint64_t surfaceInserts = 1;
+    auto& memo = memos[(d.addr >> 8 ^ d.addr >> 17 ^ d.format ^ (forRendering ? 0x55 : 0)) & 127];
+    if (memo.inserts == surfaceInserts && memo.forRendering == forRendering &&
+        !std::memcmp(&memo.d, &d, offsetof(SurfaceDesc, isDepth)) && memo.d.isDepth == d.isDepth && memo.s->gpuWritten == memo.gpuWritten)
+        return forRendering ? rescale(memo.s) : memo.s;
     auto range=R.surfaces.equal_range(d.addr);
+    const bool single = range.first != range.second && std::next(range.first) == range.second;
+    auto remember = [&](Surface* result) {
+        if (single && result == range.first->second.get())
+            memo = {d, forRendering, result->gpuWritten, surfaceInserts, result};
+        return result;
+    };
     Surface* exact=nullptr;Surface* rendered=nullptr;
     auto score=[&](Surface* s){return std::make_tuple(s->width==d.width&&s->height==d.height,s->slices==d.slices,s->writeSeq);};
     auto consider=[&](Surface* s){if(!rendered||score(s)>score(rendered))rendered=s;};
@@ -615,19 +755,31 @@ Surface* find_or_create_surface(const SurfaceDesc& d,bool forRendering) {
         auto* s=it->second.get();
         if(!forRendering&&s->isDepth&&!d.isDepth&&s->gpuWritten&&s->width==d.width&&s->height==d.height)consider(s);
         if(s->isDepth!=d.isDepth)continue;
-        if(s->width==d.width&&s->height==d.height&&s->format==d.format&&s->slices==d.slices&&
-           (forRendering||s->mips>=d.mips||s->gpuWritten)) {
-            if(forRendering)return rescale(s);
+        const bool sameShape=s->width==d.width&&s->height==d.height&&s->format==d.format&&s->slices==d.slices;
+        const bool sameIdentity=sameShape&&s->mipAddr==d.mipAddr&&s->pitch==d.pitch&&s->mips==d.mips&&
+            s->dim==d.dim&&s->tileMode==d.tileMode&&s->swizzle==d.swizzle;
+        // GPU-written aliases are deliberately separate from identity: their
+        // contents live on the GPU, and guest bytes cannot reconstruct them.
+        // Preserve the existing render-target/texture alias selection below.
+        if(sameIdentity || (sameShape&&s->gpuWritten)) {
+            if(forRendering)return remember(rescale(s));
             if(!exact||s->writeSeq>exact->writeSeq)exact=s;
         } else if(!forRendering&&s->gpuWritten&&(s->format&0x3f)==(d.format&0x3f))consider(s);
     }
-    if(exact&&(exact->gpuWritten||!rendered||exact->writeSeq>rendered->writeSeq))return exact;
-    if(rendered)return rendered;if(exact)return exact;
+    if(exact&&(exact->gpuWritten||!rendered||exact->writeSeq>rendered->writeSeq))return remember(exact);
+    if(rendered)return remember(rendered);if(exact)return remember(exact);
+    ++surfaceInserts;
     auto s=std::make_unique<Surface>();
-    s->addr=d.addr;s->mipAddr=d.mipAddr;s->width=std::max(d.width,1u);s->height=std::max(d.height,1u);
-    s->slices=std::max(d.slices,1u);s->pitch=d.pitch;s->mips=forRendering?1:std::max(d.mips,1u);
+    s->addr=d.addr;s->mipAddr=d.mipAddr;s->width=d.width;s->height=d.height;
+    s->slices=d.slices;s->pitch=d.pitch;s->mips=d.mips;
     s->format=d.format;s->dim=d.dim;s->tileMode=d.tileMode;s->swizzle=d.swizzle;s->isDepth=d.isDepth;
     s->fmt=format_info(d.format,d.isDepth);create_surface_image(s.get(),forRendering);
+    if(range.first != range.second) {
+        s->addressState=range.first->second->addressState;
+        s->addressState->ambiguous=true;
+        ++s->addressState->generation;
+    } else s->addressState=std::make_shared<SurfaceAddressState>();
+    ++R.surfaceEpoch;
     auto* raw=s.get();R.surfaces.emplace(d.addr,std::move(s));return raw;
 }
 static uint32_t mip_base(Surface* s,uint32_t level) {
@@ -642,6 +794,53 @@ static uint32_t mip_base(Surface* s,uint32_t level) {
     cached.address=address;cached.addressValid=true;
     return cached.address;
 }
+static AddressRangeIndex<Surface*> surfaceRanges;
+static std::unordered_set<Surface*> indexedSurfaces;
+static void publish_surface_ranges(Surface* s) {
+    if (indexedSurfaces.contains(s)) return;
+    // Private feedback/AO images are not owned by the guest surface cache and
+    // may be destroyed independently. Never retain their pointers here.
+    const auto owners = R.surfaces.equal_range(s->addr);
+    if (std::none_of(owners.first, owners.second,
+        [&](const auto& owner) { return owner.second.get() == s; })) return;
+    // Cached guest descriptors are immutable after find_or_create_surface.
+    // dataSize is published by the first full check before reaching here, so
+    // its base interval and the address-library mip intervals stay valid.
+    const uint64_t bytes = std::max<uint64_t>(s->dataSize,
+        uint64_t(s->pitch) * s->height * s->fmt.bytesPerBlock);
+    surfaceRanges.add(s->addr, uint64_t(s->addr) + bytes, s);
+#ifdef __SWITCH__
+    gx2::texturePageWrites.watch(s->addr, bytes);
+#endif
+    if (s->mipAddr)
+        for (uint32_t level = 1; level < s->mips; ++level) {
+            const uint64_t mip = mip_base(s, level);
+            surfaceRanges.add(mip, mip + guest_info(s, level).surfSize, s);
+#ifdef __SWITCH__
+            gx2::texturePageWrites.watch(uint32_t(mip), guest_info(s, level).surfSize);
+#endif
+        }
+    indexedSurfaces.insert(s);
+}
+#ifdef __SWITCH__
+// Pages of s written since the last sweep (the sweep turns older writes into pagesWritten).
+static bool page_writes_since_sweep(Surface* s) {
+    const uint64_t bytes = std::max<uint64_t>(s->dataSize, uint64_t(s->pitch) * s->height * s->fmt.bytesPerBlock);
+    if (gx2::texturePageWrites.written_in(s->addr, bytes)) return true;
+    if (s->mipAddr)
+        for (uint32_t level = 1; level < s->mips; ++level)
+            if (gx2::texturePageWrites.written_in(mip_base(s, level), guest_info(s, level).surfSize)) return true;
+    return false;
+}
+#endif
+// Frame boundary: textures on pages flushed since the last sweep get one check at their next use.
+void sweep_texture_page_writes() {
+#ifdef __SWITCH__
+    gx2::texturePageWrites.take_written([](uint32_t address, uint64_t size) {
+        surfaceRanges.overlaps(address, uint64_t(address) + size, [](Surface* s) { s->pagesWritten = true; });
+    });
+#endif
+}
 void upload_surface(Surface* s) {
     if(!s||!s->image||s->gpuWritten)return;
     // All callers, including render attachments, share the once-per-frame
@@ -652,8 +851,9 @@ void upload_surface(Surface* s) {
     // pages of every level were write-protected at that check, so any write since (guest code, HLE
     // copies, a save-state restore) has stamped them. Changes the game announces (GX2Invalidate on the
     // range, GX2CopySurface into it, save-state loads) set dirty. Without write tracking (page
-    // protection unavailable on the host): sampled words of every level each frame plus a full check
-    // every 64 frames, which can show a changed texture late.
+    // protection unavailable on the host, as on the Switch): sampled words of every level each frame
+    // plus a full check every 64 frames, which can show a changed texture late; the Switch narrows
+    // both with the pages the game flushed from its data cache (gx2::texturePageWrites).
     uint32_t levels=s->mips;
     std::array<std::pair<uint32_t,uint32_t>,16> ranges{};
     if(levels>ranges.size())throw std::runtime_error("GX2 texture has too many mip levels");
@@ -671,17 +871,42 @@ void upload_surface(Surface* s) {
         for(uint32_t level=0;level<levels;++level)stamp=std::min(stamp,wwatch::arm(ranges[level].first,ranges[level].second));
         s->watchStamp=stamp;
     } else {
-        full = full || ((R.frame + (s->addr >> 12)) & 63) == 0;
+        bool periodic = ((R.frame + (s->addr >> 12)) & 63) == 0;
+#ifdef __SWITCH__
+        // The periodic full hash (a multi-ms spike for a large texture) catches partial writes the sparse
+        // samples miss; only textures with flushed pages since their last full check can have any.
+        periodic = periodic && s->fullCheckPending;
+#endif
+        full = full || periodic;
+#ifdef __SWITCH__
+        // Pages watched since this surface's first full check (publish_surface_ranges) and not
+        // flushed since: the guest bytes the GPU may see are unchanged. The sparse hash still runs
+        // every 8th frame as a backstop for host-side writes that bypass the flush notification.
+        if (!full) {
+            const bool written = s->pagesWritten || page_writes_since_sweep(s);
+            s->pagesWritten = false;
+            if (written) s->fullCheckPending = true;
+            if (!written && ((R.frame + (s->addr >> 12)) & 7) != 0) return;
+        }
+#endif
         uint64_t sparse = sparse_hash(s);
         if (!full && sparse == s->sparseHash) return;
         s->sparseHash = sparse;
     }
     s->watched = true;
     ++g_stat_full_checks;
+    s->fullCheckPending = false;
+    const auto checkStart = std::chrono::steady_clock::now();
+    // Watch the pages before reading them, so a flush during the hash is not lost.
+    publish_surface_ranges(s);
     uint64_t hash=1469598103934665603ull;
     for(uint32_t level=0;level<levels;++level)
         hash=(hash^content_hash(mem::ptr(ranges[level].first),size_t(ranges[level].second)))*1099511628211ull;
+    const auto checkEnd = std::chrono::steady_clock::now();
+    g_full_check_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(checkEnd - checkStart).count();
     if(!s->dirty&&hash==s->contentHash)return;
+    struct UploadTimer { std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+        ~UploadTimer() { g_upload_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count(); } } uploadTimer;
     end_encoder();transition_image(s,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT);
     for(uint32_t level=0;level<s->mips;++level) {
         std::vector<uint8_t> data;uint32_t w,h,slices;decode_level(s,level,mip_base(s,level),data,w,h,slices);
@@ -699,17 +924,22 @@ void upload_surface(Surface* s) {
             packed=std::move(data);
             VkBufferImageCopy copy{};copy.imageSubresource={s->aspect,level,0,layers};copy.imageExtent={w,h,threeD?slices:1};copies.push_back(copy);
         }
-        Buffer staging=create_buffer(packed.size(),VK_BUFFER_USAGE_TRANSFER_SRC_BIT,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        if(!staging.mapped){defer_buffer(staging);throw std::runtime_error("Vulkan texture staging allocation is not mapped");}
+        // Color/compressed offsets must align to the host texel block size;
+        // depth/stencil offsets require four bytes (including the stencil plane).
+        auto staging=allocate_upload(packed.size(),std::max(4u,s->fmt.hostBytesPerBlock));
         memcpy(staging.mapped,packed.data(),packed.size());
+        for(auto& copy:copies)copy.bufferOffset+=staging.offset;
         vkCmdCopyBufferToImage(command_buffer(),staging.buffer,s->image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,uint32_t(copies.size()),copies.data());
-        defer_buffer(staging);
     }
     transition_image(s,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     s->contentHash=hash;s->writeSeq=next_write_seq();s->dirty=false;++g_stat_uploads;
+    if(s->addressState && s->addressState->ambiguous) ++s->addressState->generation;
 }
 void clear_color(const uint32_t*,uint32_t cb,const float rgba[4]) {
-    uint32_t first,num;auto* s=surface_from_color_buffer(cb,&first,&num);if(!s)return;
+    clear_color_payload(mem::ptr(cb), rgba);
+}
+void clear_color_payload(const void* cb,const float rgba[4]) {
+    uint32_t first,num;auto* s=surface_from_color_payload(cb,&first,&num);if(!s)return;
     if(s->fmt.depth||s->fmt.compressed)throw std::runtime_error("GX2 clear color requires an uncompressed color surface");
     VkClearColorValue value{};
     for(unsigned i=0;i<4;++i) {
@@ -723,15 +953,19 @@ void clear_color(const uint32_t*,uint32_t cb,const float rgba[4]) {
     vkCmdClearColorImage(command_buffer(),s->image,s->layout,&value,1,&range);mark_gpu_written(s);
 }
 void clear_depth_stencil(const uint32_t*,uint32_t db,float depth,uint32_t stencil,uint32_t flags) {
-    uint32_t first,num;auto* s=surface_from_depth_buffer(db,&first,&num);if(!s)return;
+    clear_depth_stencil_payload(mem::ptr(db), depth, stencil, flags);
+}
+void clear_depth_stencil_payload(const void* db,float depth,uint32_t stencil,uint32_t flags) {
+    uint32_t first,num;auto* s=surface_from_depth_payload(db,&first,&num);if(!s)return;
     VkImageAspectFlags aspects=0;if(flags&1)aspects|=VK_IMAGE_ASPECT_DEPTH_BIT;if((flags&2)&&s->fmt.stencil)aspects|=VK_IMAGE_ASPECT_STENCIL_BIT;
     if(!aspects)return;
+    if(aspects&VK_IMAGE_ASPECT_DEPTH_BIT)prepass_depth_cleared(s);
     end_encoder();transition_image(s,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT);
     VkClearDepthStencilValue value{depth,stencil};VkImageSubresourceRange range{aspects,0,1,first,num};
     vkCmdClearDepthStencilImage(command_buffer(),s->image,s->layout,&value,1,&range);mark_gpu_written(s);
 }
-void copy_surface_impl(uint32_t srcAddr,uint32_t srcMip,uint32_t srcSlice,uint32_t dstAddr,uint32_t dstMip,uint32_t dstSlice) {
-    auto* s=reinterpret_cast<GX2Surface*>(mem::ptr(srcAddr));auto* d=reinterpret_cast<GX2Surface*>(mem::ptr(dstAddr));
+void copy_surface_payload(const void* src,uint32_t srcMip,uint32_t srcSlice,const void* dstPayload,uint32_t dstMip,uint32_t dstSlice) {
+    auto* s=static_cast<const GX2Surface*>(src);auto* d=static_cast<const GX2Surface*>(dstPayload);
     if(srcMip>=uint32_t(s->numLevels)||dstMip>=uint32_t(d->numLevels))throw std::runtime_error("GX2CopySurface mip is out of range");
     uint32_t sbase=level_address(s,srcMip),dbase=level_address(d,dstMip);
     uint32_t w=std::max<uint32_t>(uint32_t(s->width)>>srcMip,1),h=std::max<uint32_t>(uint32_t(s->height)>>srcMip,1);
@@ -801,56 +1035,44 @@ void copy_surface_impl(uint32_t srcAddr,uint32_t srcMip,uint32_t srcSlice,uint32
         uint32_t offset=element_offset(di,dtm,x,y,dstSlice,bpp,dswz,&dci,(df.depth||df.convert==Convert::D24_R32F));
         memcpy(mem::ptr(dbase+offset),rows.data()+(size_t(y)*bw+x)*sf.bytesPerBlock,sf.bytesPerBlock);
     }
-    for(auto& [address,image]:R.surfaces)if(address==dbase){image->gpuWritten=false;image->dirty=true;image->lastCheckedFrame=~0ull;}
-}
-void copy_surface(uint32_t src,uint32_t srcMip,uint32_t srcSlice,uint32_t dst,uint32_t dstMip,uint32_t dstSlice) {
-    copy_surface_impl(src,srcMip,srcSlice,dst,dstMip,dstSlice);
-}
-void invalidate(uint32_t flags,uint32_t addr,uint32_t size) {
-    ++g_stat_invalidates;if(!(flags&2)||size>=0x10000000)return;
-    uint64_t end=uint64_t(addr)+size;
-    for(auto& [base,s]:R.surfaces) {
-        if(s->gpuWritten||(base>=0xF4000000&&base<0xF6000000))continue;
-        // Already pending a fresh upload/check: another write cannot further
-        // invalidate it. Count only range checks that actually reset state.
-        if(s->dirty&&s->lastCheckedFrame==~0ull)continue;
-        uint64_t bytes=std::max<uint64_t>(s->dataSize,uint64_t(s->pitch)*s->height*s->fmt.bytesPerBlock);
-        bool baseHit=uint64_t(base)<end&&uint64_t(addr)<uint64_t(base)+bytes;
-        bool mipHit=false;
-        if(!baseHit&&s->mipAddr&&s->mips>1) {
-            // Validate all guest geometry before reading shared cached ranges.
-            // Base bytes stay dynamic: dataSize and pitch can change separately.
-            guest_level(s.get(),0);
-            auto& layout=*s->guestLayout;
-            if(layout.mipRangesComplete) {
-                if(layout.mipRangeBegin<end&&uint64_t(addr)<layout.mipRangeEnd)
-                    for(uint32_t level=1;level<s->mips&&!mipHit;++level) {
-                        const auto& range=layout.levels[level];
-                        mipHit=range.rangeBegin<end&&uint64_t(addr)<range.rangeEnd;
-                    }
-            } else {
-                // Preserve the old early-hit loop while ranges are incomplete.
-                // A full traversal publishes the coarse interval atomically.
-                for(uint32_t level=1;level<s->mips&&!mipHit;++level) {
-                    const auto& info=guest_info(s.get(),level);
-                    uint64_t mip=mip_base(s.get(),level);
-                    auto& range=layout.levels[level];
-                    if(!range.rangeValid) {
-                        range.rangeBegin=mip;range.rangeEnd=mip+info.surfSize;
-                        range.rangeValid=true;++layout.mipRangesCached;
-                        layout.mipRangeBegin=std::min(layout.mipRangeBegin,range.rangeBegin);
-                        layout.mipRangeEnd=std::max(layout.mipRangeEnd,range.rangeEnd);
-                    }
-                    mipHit=mip<end&&uint64_t(addr)<mip+info.surfSize;
-                }
-                layout.mipRangesComplete=layout.mipRangesCached==s->mips-1;
-            }
-        }
-        if(baseHit||mipHit) {s->dirty=true;s->lastCheckedFrame=~0ull;++g_stat_invalidated_surfaces;}
+    for(auto& [address,image]:R.surfaces)if(address==dbase){
+        if(image->gpuWritten) ++R.surfaceTargetGeneration;
+        if(image->addressState) ++image->addressState->generation;
+        image->gpuWritten=false;image->dirty=true;image->lastCheckedFrame=~0ull;
     }
 }
+void copy_surface(uint32_t src,uint32_t srcMip,uint32_t srcSlice,uint32_t dst,uint32_t dstMip,uint32_t dstSlice) {
+    copy_surface_payload(mem::ptr(src),srcMip,srcSlice,mem::ptr(dst),dstMip,dstSlice);
+}
+void invalidate(uint32_t flags,uint32_t addr,uint32_t size) {
+    if(flags & (1u << 3)) { // GX2_INVALIDATE_MODE_SHADER, including all-range invalidates.
+#ifdef __SWITCH__
+        // Checked now, in command order: programs on pages the game flushed (a CPU write the GPU may
+        // see always goes through DCFlushRange/DCStoreRange, which marks watched pages dirty) are
+        // compared with their copies; only a real change advances the shader epoch. The game
+        // invalidates all of memory (flags F, size FFFFFFFF) ~13 times a frame: a global bump each
+        // time discarded every program hash and shader memo.
+        if(size && size<0x10000000) gx2::shaderProgramWrites.notify(addr,size);
+        vk::revalidate_programs();
+#else
+        vk::reset_shader_memoization();
+#endif
+    }
+    ++g_stat_invalidates;if(!(flags&2)||size>=0x10000000)return;
+    uint64_t end=uint64_t(addr)+size;
+    surfaceRanges.overlaps(addr, end, [&](Surface* s) {
+        const uint32_t base = s->addr;
+        if(s->gpuWritten||(base>=0xF4000000&&base<0xF6000000))return;
+        // Already pending a fresh upload/check: another write cannot further
+        // invalidate it. Count only range checks that actually reset state.
+        if(s->dirty&&s->lastCheckedFrame==~0ull)return;
+        s->dirty=true;s->lastCheckedFrame=~0ull;++g_stat_invalidated_surfaces;
+    });
+}
 void ss_reset_surfaces() {
+    ++R.surfaceEpoch;++R.viewEpoch;
     reset_ao_private_cache();
+    surfaceRanges.clear();indexedSurfaces.clear();
     for(auto& [addr,s]:R.surfaces){s->guestLayout.reset();s->dirty=true;s->lastCheckedFrame=~0ull;}
 }
 } // namespace gfxvk

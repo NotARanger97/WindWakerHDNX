@@ -112,7 +112,7 @@ __attribute__((constructor)) static void trace_init() {
     if (getenv("WWHD_NAN_PROBE")) g_ppc_trace = 1;
     if (getenv("WWHD_TRACE_FUNCS")) {
         g_ppc_trace = 1;
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__SWITCH__)
         signal(SIGUSR1, on_usr1);
 #endif
     }

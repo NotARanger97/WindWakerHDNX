@@ -1,5 +1,6 @@
 // Internal interfaces between the GX2 layer and the renderer.
 #pragma once
+#include <atomic>
 #include <cstdint>
 
 struct LatteFetchShader;
@@ -9,11 +10,25 @@ struct GX2DepthBuffer;
 }
 
 namespace gx2 {
+// Render-thread-owned stamps for the tracked GX2 register file only.
+struct DrawStateGenerations {
+    uint64_t fetch = 1, targets = 1, translation = 1;
+    uint64_t textures[2][18]{};
+    uint64_t samplers[54]{};
+    void invalidate() {
+        ++fetch; ++targets; ++translation;
+        for (auto& stage : textures) for (auto& unit : stage) ++unit;
+        for (auto& sampler : samplers) ++sampler;
+    }
+};
+extern DrawStateGenerations drawStateGenerations;
 struct ShaderKeyDirtyStats {
     uint64_t changedBatches = 0, baselineWouldBumps = 0, actualBumps = 0;
     uint64_t avoidedBumps = 0, maskedWords = 0;
 };
-ShaderKeyDirtyStats shader_key_dirty_stats(); // Render-thread diagnostics.
+ShaderKeyDirtyStats shader_key_dirty_stats();
+void log_bump_regs(uint64_t frames);
+extern std::atomic<uint64_t> g_render_idle_ns, g_main_sync_ns;  // slow-frame diagnostics // Render-thread diagnostics.
 uint32_t color_buffer_address(const GX2::GX2ColorBuffer* cb);
 LatteFetchShader* build_fetch_shader(uint32_t program);  // from our encoded fetch "program"
 }  // namespace gx2

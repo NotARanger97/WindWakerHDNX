@@ -1194,24 +1194,47 @@ void tab_about() {
     note("Built with Dear ImGui %s (MIT License, Omar Cornut and contributors).", IMGUI_VERSION);
 }
 
+#ifdef __SWITCH__
+extern "C" uint64_t switch_thread_cpu_ns(int which);  // 0 game main thread, 1 render, 2 record
+#endif
 void perf_window(bool menu_open) {
     const double t = now_s();
     if (U.fps_t0 == 0) { U.fps_t0 = t; U.fps_n0 = gx2::flips_presented(); }
+#ifdef __SWITCH__
+    // CPU time per frame of the two threads that bound the frame rate (refreshed with the fps)
+    static uint64_t cpu0[2] = {};
+    static float cpu_ms[2] = {};
+#endif
     if (t - U.fps_t0 >= 0.5) {
         uint64_t n = gx2::flips_presented();
         U.fps = (double)(n - U.fps_n0) / (t - U.fps_t0);
+#ifdef __SWITCH__
+        for (int i = 0; i < 2; ++i) {
+            const uint64_t c = switch_thread_cpu_ns(i);
+            if (cpu0[i] && n > U.fps_n0 && c >= cpu0[i]) cpu_ms[i] = float((c - cpu0[i]) / 1e6 / double(n - U.fps_n0));
+            cpu0[i] = c;
+        }
+#endif
         U.fps_t0 = t;
         U.fps_n0 = n;
     }
     float worst = 0, sum = 0;
     for (float f : U.frame_ms) { worst = std::max(worst, f); sum += f; }
+#ifdef __SWITCH__
+    // bottom left: the hearts and magic meter use the top left
+    ImGui::SetNextWindowPos(ImVec2(10, ImGui::GetIO().DisplaySize.y - 10), ImGuiCond_Always, ImVec2(0, 1));
+#else
     ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_Always);
+#endif
     ImGui::SetNextWindowBgAlpha(0.55f);
     ImGuiWindowFlags fl = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings |
                           ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoInputs;
     if (ImGui::Begin("##perf", nullptr, fl)) {
         ImGui::Text("%.0f fps   %.1f ms (worst %.1f)", U.fps, sum / 120.0f, worst);
         ImGui::PlotLines("##ft", U.frame_ms, 120, U.frame_i, nullptr, 0.0f, 50.0f, ImVec2(220, 36));
+#ifdef __SWITCH__
+        ImGui::Text("game %.1f ms   render %.1f ms", cpu_ms[0], cpu_ms[1]);
+#endif
         ImGui::TextDisabled("%s  %gx  %s", render::api_name(render::active()), hostui::res_scale(),
                             interp::mode() == 2 ? "true 60" : interp::mode() == 1 ? "60 fps" : "30 fps");
         if (float share = interp::paced_drawn_share(); share >= 0)
@@ -1363,6 +1386,7 @@ ImDrawData* frame(float pw, float ph, void (*renderer_init)()) {
             hostui::post([pro = v == "1"] { hostui::set_pro_controller(pro); });
         // the saved rumble choice (WWHD_RUMBLE wins)
         if (!rumble::env_override() && hostui::get("rumble", v)) rumble::set_enabled(v != "0");
+        if (const char* e = getenv("WWHD_PERF_OVERLAY")) g_perf = atoi(e) != 0;
     }
     if (!test.done && render::frame_count() + 1 >= test.at) {
         test.done = true;

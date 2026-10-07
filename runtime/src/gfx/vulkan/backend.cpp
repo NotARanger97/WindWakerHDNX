@@ -19,7 +19,12 @@
 #endif
 #include "platform/host.h"
 #include "platform/perf_hint.h"
+#ifdef __SWITCH__
+#include "platform/switch/vk_record_thread.h"
+#endif
 #include "runtime.h"
+#include "frame_trace.h"
+#include "gx2/shader_program_writes.h"
 #include "shaders.h"
 #include "settings.h"
 #include "sparse_hash_memo.h"
@@ -49,7 +54,12 @@
 namespace gx2 { uint64_t flips_presented(); void checkpoint_vulkan_caches(); }
 namespace interp { int mode(); }
 
+#ifdef __SWITCH__
+extern "C" uint64_t switch_thread_cpu_ns(int which);  // platform/switch/switch_host.cpp
+#endif
+extern "C" std::atomic<uint64_t> g_vk_draw_calls;  // draw.cpp: draws received from the game
 namespace gfxvk {
+extern uint64_t g_stat_full_checks, g_stat_uploads, g_upload_ns, g_full_check_ns;  // surfaces.cpp
 Renderer R;
 namespace {
 bool perf_enabled() {
@@ -62,6 +72,19 @@ bool cpu_only_stats_enabled() {
     return value && !std::strcmp(value, "1");
   }();
   return enabled;
+}
+bool asynchronous_submissions() {
+#ifdef __SWITCH__
+  return true;
+#else
+  // Desktop opt-in exercises the Switch submission/presentation path with
+  // Vulkan validation, without changing normal desktop pacing.
+  static const bool enabled = [] {
+    const char* value = std::getenv("WWHD_VK_ASYNC");
+    return value && !std::strcmp(value, "1");
+  }();
+  return enabled;
+#endif
 }
 struct WaitTiming { uint64_t count = 0, ns = 0; };
 struct PresentTiming { WaitTiming acquire, present, idle; };
@@ -254,8 +277,12 @@ void start_pipeline_cache_write() {
   if (vkGetPipelineCacheData(R.device,R.pipelineCache,&size,bytes.data())!=VK_SUCCESS) return;
   bytes.resize(size);
   if (!compatible_pipeline_cache(bytes)) return;
-  pipelineCacheWrite=std::async(std::launch::async,write_pipeline_cache,
-      std::move(bytes),pipelineCachePath,R.pipelineCreates,R.pipelineCacheChangedFrame);
+  pipelineCacheWrite=std::async(std::launch::async,
+      [bytes=std::move(bytes),path=pipelineCachePath,creates=R.pipelineCreates,
+       changed=R.pipelineCacheChangedFrame]() mutable {
+        host::background_thread();  // only time the game and render threads leave idle
+        return write_pipeline_cache(std::move(bytes),std::move(path),creates,changed);
+      });
 }
 void checkpoint_pipeline_cache() try {
   poll_pipeline_cache_write(false);
@@ -290,8 +317,8 @@ uint32_t memory_type(uint32_t bits, VkMemoryPropertyFlags flags) {
       return i;
   throw std::runtime_error("No compatible Vulkan memory type");
 }
-Buffer create_buffer(VkDeviceSize size, VkBufferUsageFlags usage,
-                     VkMemoryPropertyFlags flags) {
+static Buffer create_buffer(VkDeviceSize size, VkBufferUsageFlags usage,
+                            VkMemoryPropertyFlags flags, VkMemoryPropertyFlags preferred) {
   Buffer b;
   b.size = std::max<VkDeviceSize>(size, 16);
   VkBufferCreateInfo ci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
@@ -303,7 +330,20 @@ Buffer create_buffer(VkDeviceSize size, VkBufferUsageFlags usage,
   vkGetBufferMemoryRequirements(R.device, b.buffer, &req);
   VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
   ai.allocationSize = req.size;
-  ai.memoryTypeIndex = memory_type(req.memoryTypeBits, flags);
+  VkPhysicalDeviceMemoryProperties properties;
+  vkGetPhysicalDeviceMemoryProperties(R.physicalDevice, &properties);
+  ai.memoryTypeIndex = UINT32_MAX;
+  if (preferred)
+    for (uint32_t i = 0; i < properties.memoryTypeCount; ++i)
+      if ((req.memoryTypeBits & (1u << i)) &&
+          (properties.memoryTypes[i].propertyFlags & preferred) == preferred) {
+        ai.memoryTypeIndex = i;
+        break;
+      }
+  if (ai.memoryTypeIndex == UINT32_MAX)
+    ai.memoryTypeIndex = memory_type(req.memoryTypeBits, flags);
+  b.allocationSize = req.size;
+  b.properties = properties.memoryTypes[ai.memoryTypeIndex].propertyFlags;
   vk_check(vkAllocateMemory(R.device, &ai, nullptr, &b.memory),
            "allocate buffer memory");
   vk_check(vkBindBufferMemory(R.device, b.buffer, b.memory, 0),
@@ -313,34 +353,145 @@ Buffer create_buffer(VkDeviceSize size, VkBufferUsageFlags usage,
              "map buffer");
   return b;
 }
+Buffer create_buffer(VkDeviceSize size, VkBufferUsageFlags usage,
+                     VkMemoryPropertyFlags flags) {
+  return create_buffer(size, usage, flags, 0);
+}
 UploadSlice allocate_upload(VkDeviceSize size, VkDeviceSize alignment) {
   size = std::max<VkDeviceSize>(size,16);
   alignment = std::max<VkDeviceSize>(alignment,4);
   auto slice = [&](Renderer::UploadBlock& block) {
-    VkDeviceSize offset = ((block.used + alignment - 1) / alignment) * alignment;
-    if (offset > block.buffer.size || size > block.buffer.size - offset)
+    const VkDeviceSize end = block.capacity ? block.base + block.capacity : block.buffer.size;
+    VkDeviceSize offset = ((block.base + block.used + alignment - 1) / alignment) * alignment;
+    if (offset > end || size > end - offset)
       return UploadSlice{};
-    block.used = offset + size;
+    block.used = offset + size - block.base;
+    // Reserve the entire writable slice as dirty, covering snapshot padding,
+    // partial vertex windows and direct mapped writes without per-writer hooks.
+    if (!(block.buffer.properties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+      block.dirtyBegin = std::min(block.dirtyBegin, offset);
+      block.dirtyEnd = std::max(block.dirtyEnd, offset + size);
+    }
     R.uploadBytes += size;
-    return UploadSlice{block.buffer.buffer,offset,size,
+    UploadSlice result{block.buffer.buffer,offset,size,
                        static_cast<uint8_t*>(block.buffer.mapped)+offset};
+#ifdef __SWITCH__
+    // Coherent fallback memory on Tegra is uncached: skip mapped reuse reads.
+    result.cpuReadable = (block.buffer.properties & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0;
+#endif
+    return result;
   };
   for (auto& block : R.uploadBlocks) {
     auto result = slice(block);
     if (result.buffer) return result;
   }
+  VkMemoryPropertyFlags preferred = 0;
+#ifdef __SWITCH__
+  preferred = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+  // Each submission slot's first block is its own 32 MiB range of one buffer shared by all slots.
+  // Descriptor sets name the uniform buffer, so with a buffer per slot every draw needed one set per
+  // slot (draws rotate through the slots: ~3 submissions a frame, 4 slots) and each newly visible
+  // material combination created four (600-800 new sets a frame while walking).
+  constexpr VkDeviceSize kSlotRange = 32ull << 20;
+  static Buffer shared{};
+  if (R.uploadBlocks.empty() && size <= kSlotRange) {
+    if (!shared.buffer)
+      shared = create_buffer(kSlotRange * R.submissions.size(),
+          VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+          VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, preferred);
+    R.uploadBlocks.push_back({shared, 0, VK_WHOLE_SIZE, 0, kSlotRange * R.activeSubmission, kSlotRange});
+    ++R.uploadAllocations;
+    if (auto result = slice(R.uploadBlocks.back()); result.buffer) return result;
+  }
+#endif
   auto buffer = create_buffer(std::max<VkDeviceSize>(32ull<<20,size),
       VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
       VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, preferred);
   R.uploadBlocks.push_back({buffer,0});
   ++R.uploadAllocations;
   return slice(R.uploadBlocks.back());
 }
+static void flush_uploads() {
+  // Retain range capacity across submissions; one Vulkan call flushes all
+  // dirty blocks, with one coalesced interval per block.
+  static std::vector<VkMappedMemoryRange> ranges;
+  ranges.clear();
+  const VkDeviceSize atom = R.properties.limits.nonCoherentAtomSize;
+  for (auto& block : R.uploadBlocks) {
+    if (block.dirtyBegin == VK_WHOLE_SIZE) continue;
+    VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+    range.memory = block.buffer.memory;
+    range.offset = (block.dirtyBegin / atom) * atom;
+    const VkDeviceSize end = std::min(block.buffer.allocationSize,
+        ((block.dirtyEnd + atom - 1) / atom) * atom);
+    // The whole allocation is mapped. A final partial atom is legal only at
+    // the allocation end, which can extend past the buffer's logical size.
+    range.size = end - range.offset;
+    ranges.push_back(range);
+  }
+  if (ranges.empty()) return;
+  vk_check(vkFlushMappedMemoryRanges(R.device, uint32_t(ranges.size()), ranges.data()),
+           "flush upload memory");
+  for (auto& block : R.uploadBlocks) {
+    block.dirtyBegin = VK_WHOLE_SIZE;
+    block.dirtyEnd = 0;
+  }
+}
 void defer_buffer(Buffer b) { R.garbageBuffers.push_back(b); }
+void defer_descriptor_pool(VkDescriptorPool pool) { if (pool) R.garbagePools.push_back(pool); }
+#ifdef __SWITCH__
+extern "C" bool switch_mem2(uint8_t** host);  // platform/switch/switch_host.cpp
+// Import guest MEM2 for the GPU (WWHD_ZERO_COPY=0 keeps copying vertex/index data). The memory
+// stays CPU-cached; the game's DCFlushRange calls clean the CPU cache for the GPU, as on the Wii U.
+static void import_guest_mem2() {
+  if (const char* e = std::getenv("WWHD_ZERO_COPY"); e && !std::strcmp(e, "0")) return;
+  uint8_t* host = nullptr;
+  if (!switch_mem2(&host) || !host) { LOG("[vulkan] MEM2 is not GPU-mappable: vertex data is copied"); return; }
+  constexpr VkDeviceSize kSize = 0x40000000;
+  auto getProps = (PFN_vkGetMemoryHostPointerPropertiesEXT)vkGetDeviceProcAddr(R.device, "vkGetMemoryHostPointerPropertiesEXT");
+  VkMemoryHostPointerPropertiesEXT hp{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+  if (!getProps || getProps(R.device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, host, &hp) != VK_SUCCESS) {
+    LOG("[vulkan] MEM2 import: no host pointer properties"); return;
+  }
+  VkExternalMemoryBufferCreateInfo ext{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+  ext.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+  VkBufferCreateInfo ci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+  ci.pNext = &ext;
+  ci.size = kSize;
+  ci.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+  if (vkCreateBuffer(R.device, &ci, nullptr, &R.guestMem2Buffer) != VK_SUCCESS) { LOG("[vulkan] MEM2 import: buffer"); return; }
+  VkMemoryRequirements req;
+  vkGetBufferMemoryRequirements(R.device, R.guestMem2Buffer, &req);
+  VkPhysicalDeviceMemoryProperties mp;
+  vkGetPhysicalDeviceMemoryProperties(R.physicalDevice, &mp);
+  uint32_t type = UINT32_MAX, bits = req.memoryTypeBits & hp.memoryTypeBits;
+  for (uint32_t i = 0; i < mp.memoryTypeCount && type == UINT32_MAX; ++i)
+    if ((bits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) type = i;
+  VkImportMemoryHostPointerInfoEXT imp{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT};
+  imp.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+  imp.pHostPointer = host;
+  VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+  ai.pNext = &imp;
+  ai.allocationSize = kSize;
+  ai.memoryTypeIndex = type;
+  if (type == UINT32_MAX || req.size > kSize ||
+      vkAllocateMemory(R.device, &ai, nullptr, &R.guestMem2Memory) != VK_SUCCESS ||
+      vkBindBufferMemory(R.device, R.guestMem2Buffer, R.guestMem2Memory, 0) != VK_SUCCESS) {
+    LOG("[vulkan] MEM2 import failed (type %u, size %llu): vertex data is copied", type, (unsigned long long)req.size);
+    if (R.guestMem2Memory) vkFreeMemory(R.device, R.guestMem2Memory, nullptr);
+    vkDestroyBuffer(R.device, R.guestMem2Buffer, nullptr);
+    R.guestMem2Buffer = VK_NULL_HANDLE; R.guestMem2Memory = VK_NULL_HANDLE;
+    return;
+  }
+  LOG("[vulkan] guest MEM2 imported for the GPU (memory type %u): vertex/index data is read in place", type);
+}
+#endif
 void defer_surface_image(VkImage image, VkDeviceMemory memory,
-                         std::vector<VkImageView> views) {
-  R.garbageImages.push_back({image, memory, std::move(views)});
+                         std::vector<VkImageView> views, SurfaceImageKey key,
+                         VkDeviceSize allocationBytes) {
+  R.garbageImages.push_back({image, memory, std::move(views), key, allocationBytes});
 }
 void forget_texture_views() {
 } // descriptor sets are rebuilt for every draw and retired on submit
@@ -420,6 +571,10 @@ static void init_gpu_timestamp_queries() {
   LOG("[vulkan GPU timestamps] enabled: %u valid bits, %.9g ns/tick; submission intervals, NOT GPU busy time",
       R.gpuTimestampValidBits, double(R.properties.limits.timestampPeriod));
 }
+static uint64_t steady_ns() {
+  return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count());
+}
 static void collect_gpu_timestamp_queries(Renderer::Submission& slot) {
   if (!slot.timestampRecorded) return;
   slot.timestampRecorded = false; // Consume this submission exactly once.
@@ -441,6 +596,20 @@ static void collect_gpu_timestamp_queries(Renderer::Submission& slot) {
   }
   const double ns = double(timestamp_elapsed_ticks(values[0].ticks, values[1].ticks,
       R.gpuTimestampValidBits)) * double(R.properties.limits.timestampPeriod);
+  // WWHD_VK_SUBMIT_LOG=n: the first n submissions after frame WWHD_VK_SUBMIT_LOG_FROM (default 0)
+  // with CPU begin/submit/collect and GPU start/end times in microseconds (GPU: its own clock base).
+  // On the Switch the GPU ticks ran ~1.63x slower than timestampPeriod claims (measured against fence
+  // waits), so every GPU timestamp figure here undercounts real GPU time by that factor.
+  static int64_t submitLog = [] { const char* e = std::getenv("WWHD_VK_SUBMIT_LOG"); return e ? atoll(e) : 0; }();
+  static uint64_t submitLogFrom = [] { const char* e = std::getenv("WWHD_VK_SUBMIT_LOG_FROM"); return e ? strtoull(e, nullptr, 10) : 0; }();
+  if (submitLog > 0 && slot.timestampFrame >= submitLogFrom) {
+    --submitLog;
+    const double period = double(R.properties.limits.timestampPeriod);
+    LOG("[vk submit] serial %llu frame %llu cpu begin %.1f submit %.1f collect %.1f gpu start %.1f end %.1f us",
+        (unsigned long long)slot.serial, (unsigned long long)slot.timestampFrame,
+        slot.beginNs / 1e3, slot.submitNs / 1e3, steady_ns() / 1e3,
+        double(values[0].ticks) * period / 1e3, double(values[1].ticks) * period / 1e3);
+  }
   auto& stats = R.gpuTimestampStats;
   ++stats.submissions;
   stats.intervalNs += ns;
@@ -511,8 +680,20 @@ static void report_gpu_timestamps() {
   R.gpuTimestampStats = {};
   previousFrame = R.frame;
 }
+static void wait_submission_traced(uint64_t serial, char trace);
+void draw_timing_command_begin(VkCommandBuffer cmd);  // draw.cpp, WWHD_VK_DRAW_TIMING
 VkCommandBuffer command_buffer() {
+  if (asynchronous_submissions() && R.beginFrame) {
+    R.beginFrame=false;
+    wait_submission_traced(R.frameSubmissions[R.frame%R.frameSubmissions.size()],'F');
+  }
   if (!R.recording) {
+#ifdef __SWITCH__
+    // Retired slot, no commands queued for it yet. Reset here so the host
+    // synchronization boundary does not drain recording at the end of a batch.
+    if (vkrecord::enabled())
+      vk_check(vkResetFences(R.device, 1, &R.fence), "reset fence");
+#endif
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vk_check(vkBeginCommandBuffer(R.cmd, &bi), "begin command buffer");
@@ -524,7 +705,9 @@ VkCommandBuffer command_buffer() {
       vkCmdWriteTimestamp(R.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, slot.timestampQueries, 0);
       slot.timestampRecorded = true;
       slot.timestampFrame = R.frame;
+      slot.beginNs = steady_ns();
     }
+    draw_timing_command_begin(R.cmd);
   }
   return R.cmd;
 }
@@ -646,7 +829,9 @@ void transition_image(Surface *s, VkImageLayout layout,
 }
 static void cleanup_submission(Renderer::Submission& slot) {
   // The submit fence has completed; slices can now be overwritten safely.
-  for (auto& block : slot.uploadBlocks) block.used = 0;
+  for (auto& block : slot.uploadBlocks) {
+    block.used = 0;block.dirtyBegin = VK_WHOLE_SIZE;block.dirtyEnd = 0;
+  }
   for (auto b : slot.garbageBuffers) {
     if (b.mapped)
       vkUnmapMemory(R.device, b.memory);
@@ -654,15 +839,10 @@ static void cleanup_submission(Renderer::Submission& slot) {
     vkFreeMemory(R.device, b.memory, nullptr);
   }
   slot.garbageBuffers.clear();
-  for (auto &i : slot.garbageImages) {
-    for (auto v : i.views)
-      if (v)
-        vkDestroyImageView(R.device, v, nullptr);
-    if (i.image)
-      vkDestroyImage(R.device, i.image, nullptr);
-    if (i.memory)
-      vkFreeMemory(R.device, i.memory, nullptr);
-  }
+  for (auto pool : slot.garbagePools) vkDestroyDescriptorPool(R.device, pool, nullptr);
+  slot.garbagePools.clear();
+  for (auto &i : slot.garbageImages)
+    recycle_surface_image(std::move(i));
   slot.garbageImages.clear();
   vk_check(vkResetCommandPool(R.device, slot.commandPool, 0),
            "reset command pool");
@@ -670,10 +850,14 @@ static void cleanup_submission(Renderer::Submission& slot) {
            "reset descriptor pool");
   ++R.submissionGeneration;
 }
-static void retire_submission(Renderer::Submission& slot, WaitTiming& timing=submitWait) {
+// trace: WWHD_FRAME_TRACE code of a GPU wait (A slot reuse, F frame N-2, W other waits)
+static void retire_submission(Renderer::Submission& slot, WaitTiming& timing=submitWait, char trace='W') {
   if (!slot.pending) return;
   VkResult status=vkGetFenceStatus(R.device,slot.fence);
   if (status==VK_NOT_READY) {
+    // frame trace: upper case at the start of a GPU wait, lower case at its end
+    frame_trace::event(trace);
+    struct TraceEnd { char c; ~TraceEnd() { frame_trace::event(c); } } traceEnd{char(trace+32)};
     vk_check(timed_call(timing,[&] {
       return vkWaitForFences(R.device,1,&slot.fence,VK_TRUE,UINT64_MAX);
     }),"wait submission retirement");
@@ -685,14 +869,16 @@ static void retire_submission(Renderer::Submission& slot, WaitTiming& timing=sub
 }
 static void activate_submission(size_t index) {
   auto& slot=R.submissions[index];
-  retire_submission(slot);
+  retire_submission(slot,submitWait,'A');
   R.activeSubmission=index;
+  slot.serial=++R.submissionSerial;
   slot.gpuScopeCount=0;slot.activeRenderScope=UINT32_MAX;
   ++R.submissionGeneration;
   R.commandPool=slot.commandPool;R.cmd=slot.cmd;R.fence=slot.fence;
   R.descriptorPool=slot.descriptorPool;
   R.uploadBlocks=std::move(slot.uploadBlocks);
   R.garbageBuffers=std::move(slot.garbageBuffers);
+  R.garbagePools=std::move(slot.garbagePools);
   R.garbageImages=std::move(slot.garbageImages);
   R.recording=false;R.rendering=false;R.passTracked=false;
 }
@@ -706,16 +892,19 @@ static void drain_submissions() {
   if (newest) retire_submission(*newest);
   for (auto& slot:R.submissions) retire_submission(slot);
 }
-static void submit(VkSemaphore wait = VK_NULL_HANDLE,
+static uint64_t submit(VkSemaphore wait = VK_NULL_HANDLE,
                    VkSemaphore signal = VK_NULL_HANDLE, bool asynchronous=false) {
   if (!R.recording)
-    return;
+    return R.lastSubmittedSerial;
   end_encoder();
   auto& recordingSlot = R.submissions[R.activeSubmission];
   if (recordingSlot.timestampRecorded)
     vkCmdWriteTimestamp(R.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                         recordingSlot.timestampQueries, 1);
   vk_check(vkEndCommandBuffer(R.cmd), "end command buffer");
+#ifdef __SWITCH__
+  if (!vkrecord::enabled())
+#endif
   vk_check(vkResetFences(R.device, 1, &R.fence), "reset fence");
   VkPipelineStageFlags stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
   VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -730,13 +919,19 @@ static void submit(VkSemaphore wait = VK_NULL_HANDLE,
     si.signalSemaphoreCount = 1;
     si.pSignalSemaphores = &signal;
   }
+  // Each block belongs exclusively to this submission until fence retirement;
+  // atom expansion cannot race another slot's GPU reads or CPU writes.
+  flush_uploads();
+  frame_trace::event('S');
+  R.submissions[R.activeSubmission].submitNs = steady_ns();
   vk_check(vkQueueSubmit(R.queue, 1, &si, R.fence), "submit graphics");
   R.recording=false;
   auto& slot=R.submissions[R.activeSubmission];
-  static uint64_t nextSubmissionSerial=0;
-  slot.serial=++nextSubmissionSerial;
+  const uint64_t serial=slot.serial;
+  R.lastSubmittedSerial=serial;
   slot.uploadBlocks=std::move(R.uploadBlocks);
   slot.garbageBuffers=std::move(R.garbageBuffers);
+  slot.garbagePools=std::move(R.garbagePools);
   slot.garbageImages=std::move(R.garbageImages);
   slot.pending=true;
   if (asynchronous) {
@@ -745,7 +940,23 @@ static void submit(VkSemaphore wait = VK_NULL_HANDLE,
     retire_submission(slot,wait ? presentSubmitWait : submitWait);
     activate_submission(R.activeSubmission);
   }
+  return serial;
 }
+uint64_t recording_submission() {
+  return R.submissions[R.activeSubmission].serial;
+}
+static void wait_submission_traced(uint64_t serial, char trace) {
+  if (!serial) return;
+  // A reader may request a token before its commands have been submitted.
+  if (serial==recording_submission() && R.recording) flush_async();
+  for (auto& slot:R.submissions)
+    if (slot.serial==serial) {
+      retire_submission(slot,submitWait,trace);
+      return;
+    }
+  // Absent tokens have already completed and their slot has been reused.
+}
+void wait_submission(uint64_t serial) { wait_submission_traced(serial,'W'); }
 void flush_async() {
   // Deferred objects may reference earlier queued work even if this slot has
   // no draw commands. Submit an empty command buffer to retire them in order.
@@ -753,12 +964,24 @@ void flush_async() {
   submit(VK_NULL_HANDLE,VK_NULL_HANDLE,true);
 }
 void flush() {
+  if (asynchronous_submissions()) {
+    flush_async();
+    return;
+  }
   if (!R.recording && (!R.garbageBuffers.empty() || !R.garbageImages.empty())) command_buffer();
   submit();
   drain_submissions();
 }
+void flush_readback() {
+  if (!R.recording && (!R.garbageBuffers.empty() || !R.garbageImages.empty())) command_buffer();
+  // Keep this completed slot active for reuse; unlike flush(), there is no
+  // drain of other slots (the readback fence already covers earlier work).
+  const uint64_t serial=submit();
+  wait_submission(serial);
+}
 void wait_idle() {
-  flush();
+  flush_async();
+  drain_submissions();
   vk_check(vkDeviceWaitIdle(R.device), "device idle");
 }
 void with_autorelease_pool(void (*fn)()) { host::with_autorelease_pool(fn); }
@@ -770,7 +993,7 @@ static bool has_extension(const std::vector<VkExtensionProperties> &es,
                      [&](auto &e) { return !strcmp(e.extensionName, name); });
 }
 static void make_swapchain(Screen &s) {
-  vk_check(vkDeviceWaitIdle(R.device), "resize device idle");
+  wait_idle();
   VkSurfaceCapabilitiesKHR caps;
   vk_check(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(R.physicalDevice,
                                                      s.surface, &caps),
@@ -906,6 +1129,7 @@ static void make_swapchain(Screen &s) {
   vk_check(vkCreateSwapchainKHR(R.device, &ci, nullptr, &sc),
            "create swapchain");
   reset_present_screen(s); // Device was drained above; old views are no longer in use.
+  for (auto semaphore:s.finished) vkDestroySemaphore(R.device,semaphore,nullptr);
   if (s.swapchain)
     vkDestroySwapchainKHR(R.device, s.swapchain, nullptr);
   s.swapchain = sc;
@@ -915,6 +1139,11 @@ static void make_swapchain(Screen &s) {
   s.images.resize(n);
   vkGetSwapchainImagesKHR(R.device, sc, &n, s.images.data());
   s.layouts.assign(n, VK_IMAGE_LAYOUT_UNDEFINED);
+  s.finished.assign(n,VK_NULL_HANDLE);
+  VkSemaphoreCreateInfo semaphore{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+  for (auto& finished:s.finished)
+    vk_check(vkCreateSemaphore(R.device,&semaphore,nullptr,&finished),
+             "create present semaphore");
   prepare_present_screen(s,shaderPresentation,captureTransfer);
   s.resize = false;
 }
@@ -961,12 +1190,12 @@ static bool SDLCALL lifecycle_watch(void *, SDL_Event *event) {
   return true;
 }
 #endif
-// Asynchronous presentation (WWHD_VK_ASYNC_PRESENT=1, the default on Android): the presentation
-// submission goes into the four-slot ring like GX2Flush work instead of waiting for the GPU, and the
-// SDL host's swap() does not drain the queue, so the render thread records frame N+1 while the GPU
-// draws frame N. Each frame in flight has its own acquire semaphore (reused only after the submission
-// that waited on it retired) and each swapchain image its own render-finished semaphore. Captures
-// keep the waiting path.
+// Asynchronous presentation (WWHD_VK_ASYNC_PRESENT=1, the default on Android; always on the Switch,
+// see asynchronous_submissions): the presentation submission goes into the four-slot ring like
+// GX2Flush work instead of waiting for the GPU, and the SDL host's swap() does not drain the queue, so
+// the render thread records frame N+1 while the GPU draws frame N. Each submission slot has its own
+// acquire semaphores (reused only after that slot retired) and each swapchain image its own
+// render-finished semaphore. Captures keep the waiting path.
 static bool async_present() {
   static const bool on = [] {
     const char *e = std::getenv("WWHD_VK_ASYNC_PRESENT");
@@ -977,20 +1206,6 @@ static bool async_present() {
 #endif
   }();
   return on;
-}
-struct AsyncPresentState {
-  std::array<VkSemaphore, 3> acquire{};
-  std::array<uint64_t, 3> serial{};  // submission that waited on acquire[k]
-  std::array<size_t, 3> slot{};
-  unsigned next = 0;
-  std::vector<VkSemaphore> finished;  // per swapchain image
-};
-static AsyncPresentState asyncPresent[2];  // TV, GamePad
-static VkSemaphore new_semaphore() {
-  VkSemaphoreCreateInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
-  VkSemaphore sem;
-  vk_check(vkCreateSemaphore(R.device, &si, nullptr, &sem), "create presentation semaphore");
-  return sem;
 }
 static void present(Screen &s) {
 #ifdef __ANDROID__
@@ -1042,25 +1257,16 @@ static void present(Screen &s) {
     make_swapchain(s);
 #endif
   uint32_t index;
-  auto& timing = screenTiming[&s == &R.tv ? 0 : 1];
-  const bool async = async_present() && !present_capture_requested();
-  AsyncPresentState &ap = asyncPresent[&s == &R.tv ? 0 : 1];
-  VkSemaphore acquireSemaphore = s.acquired;
-  unsigned acquireIndex = 0;
-  if (async) {
-    acquireIndex = ap.next;
-    ap.next = (ap.next + 1) % ap.acquire.size();
-    if (!ap.acquire[acquireIndex])
-      ap.acquire[acquireIndex] = new_semaphore();
-    // the submission that last waited on this semaphore must be done with it
-    auto &previous = R.submissions[ap.slot[acquireIndex]];
-    if (ap.serial[acquireIndex] && previous.pending && previous.serial == ap.serial[acquireIndex])
-      retire_submission(previous);
-    acquireSemaphore = ap.acquire[acquireIndex];
-  }
+  const size_t screenIndex=&s == &R.tv ? 0 : 1;
+  // asynchronous: the presentation submission joins the four-slot ring instead of waiting for the GPU
+  // (the Switch always; elsewhere WWHD_VK_ASYNC_PRESENT); captures keep the waiting path there
+  const bool async = asynchronous_submissions() || (async_present() && !present_capture_requested());
+  // per submission slot (reused only once the slot retired), so frames in flight never share one
+  const VkSemaphore acquired=R.submissions[R.activeSubmission].acquired[screenIndex];
+  auto& timing = screenTiming[screenIndex];
   VkResult ar = timed_call(timing.acquire, [&] {
     return vkAcquireNextImageKHR(R.device, s.swapchain, UINT64_MAX,
-                                acquireSemaphore, VK_NULL_HANDLE, &index);
+                                acquired, VK_NULL_HANDLE, &index);
   });
   if (ar == VK_ERROR_OUT_OF_DATE_KHR) {
     s.resize = true;
@@ -1124,28 +1330,12 @@ static void present(Screen &s) {
     s.layouts[index] = b.newLayout;
   }
   record_present_capture(s,index);
-  VkSemaphore finishedSemaphore = s.finished;
-  if (async) {
-    if (ap.finished.size() != s.images.size()) {  // new swapchain
-      vk_check(vkDeviceWaitIdle(R.device), "presentation semaphores idle");
-      for (VkSemaphore f : ap.finished)
-        vkDestroySemaphore(R.device, f, nullptr);
-      ap.finished.clear();
-      for (size_t i = 0; i < s.images.size(); i++)
-        ap.finished.push_back(new_semaphore());
-    }
-    finishedSemaphore = ap.finished[index];
-    const size_t slot = R.activeSubmission;
-    submit(acquireSemaphore, finishedSemaphore, true);
-    ap.slot[acquireIndex] = slot;
-    ap.serial[acquireIndex] = R.submissions[slot].serial;
-  } else {
-    submit(s.acquired, s.finished);
-  }
+  const VkSemaphore finished=s.finished[index];
+  submit(acquired, finished, async);
   finish_present_capture(s);
   VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
   pi.waitSemaphoreCount = 1;
-  pi.pWaitSemaphores = &finishedSemaphore;
+  pi.pWaitSemaphores = &finished;
   pi.swapchainCount = 1;
   pi.pSwapchains = &s.swapchain;
   pi.pImageIndices = &index;
@@ -1173,7 +1363,10 @@ static void present(Screen &s) {
              "present completion");
 }
 void copy_to_scan(uint32_t cb, uint32_t target) {
-  Surface *src = surface_from_color_buffer(cb);
+  copy_to_scan_payload(mem::ptr(cb), target);
+}
+void copy_to_scan_payload(const void* cb, uint32_t target) {
+  Surface *src = surface_from_color_payload(cb);
   if (!src)
     return;
   Screen &s = target == 4 ? R.drc : R.tv;
@@ -1317,13 +1510,70 @@ void swap() {
     }
   }
   set_present_plan(nullptr);
+  if (asynchronous_submissions()) {
+    R.frameSubmissions[R.frame%R.frameSubmissions.size()]=R.lastSubmittedSerial;
+    R.beginFrame=true;
+  }
   std::atomic_ref<uint64_t>(R.frame).fetch_add(1);
   R.completed = R.frame;
+#ifdef __SWITCH__
+  vkrecord::report(R.frame);
+#endif
   report_gpu_timestamps();
   perf_hint::frame_done();
-  checkpoint_pipeline_cache();
-  vk::checkpoint_shader_cache(R.frame);
+  {
+    const auto checkpointStart = std::chrono::steady_clock::now();
+    checkpoint_pipeline_cache();
+    checkpoint_pipeline_recipes();
+    vk::checkpoint_shader_cache(R.frame);
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - checkpointStart).count();
+    if (ms > 2.0) LOG("[vulkan cache] frame %llu: cache checkpoints took %.1f ms", (unsigned long long)R.frame, ms);
+  }
   latch_res_scale();
+  sweep_texture_page_writes();
+#ifdef __SWITCH__
+  vk::revalidate_programs();  // once a frame: programs on flushed pages vs their copies
+#endif
+#ifdef __SWITCH__
+  // WWHD_SLOW_FRAMES=1: one line per swap interval over 40 ms, with what the frame spent its time on
+  static const bool slowFrames = std::getenv("WWHD_SLOW_FRAMES") != nullptr;
+  if (slowFrames) {
+    static uint64_t lastIdle = 0, lastSync = 0;
+    const uint64_t idleNs = gx2::g_render_idle_ns.load(), syncNs = gx2::g_main_sync_ns.load();
+    static uint64_t lastTick = 0, lastMain = 0, lastRender = 0, lastRecord = 0, lastUploadNs = 0,
+                    lastUploads = 0, lastChecks = 0, lastCheckNs = 0, lastCompiles = 0, lastPipes = 0,
+                    lastDraws = 0, lastDescAllocs = 0, lastDescLookups = 0, lastLookups = 0,
+                    lastEpoch = 0, lastDestroys = 0, lastSurfaces = 0, lastSkipped = 0;
+    const uint64_t drawCalls = g_vk_draw_calls.load(std::memory_order_relaxed);
+    const uint64_t shaderLookups = vk::shader_stats().lookups;
+    const uint64_t tick = uint64_t(std::chrono::steady_clock::now().time_since_epoch().count());
+    const uint64_t mainNs = switch_thread_cpu_ns(0), renderNs = switch_thread_cpu_ns(1), recordNs = switch_thread_cpu_ns(2);
+    const uint64_t compiles = vk::shader_stats().compiles;
+    if (lastTick) {
+      const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::duration(tick - lastTick)).count();
+      if (ms > 40.0)
+        LOG("[slow frame] %llu: %.1f ms; cpu main %.1f render %.1f record %.1f; render idle %.1f, game in DrawDone %.1f; textures: %llu uploads %.1f ms, %llu full checks %.1f ms; %llu shaders, %llu pipelines; draws %llu, descriptor sets %llu new / %llu lookups, shader lookups %llu; surface epoch +%llu, image destroys %llu, surfaces +%llu; async: %llu draws skipped, %zu shaders compiling",
+            (unsigned long long)R.frame, ms, (mainNs - lastMain) / 1e6, (renderNs - lastRender) / 1e6,
+            (recordNs - lastRecord) / 1e6, (idleNs - lastIdle) / 1e6, (syncNs - lastSync) / 1e6,
+            (unsigned long long)(g_stat_uploads - lastUploads),
+            (g_upload_ns - lastUploadNs) / 1e6, (unsigned long long)(g_stat_full_checks - lastChecks),
+            (g_full_check_ns - lastCheckNs) / 1e6, (unsigned long long)(compiles - lastCompiles),
+            (unsigned long long)(R.pipelineCreates - lastPipes), (unsigned long long)(drawCalls - lastDraws),
+            (unsigned long long)(R.descriptorAllocations - lastDescAllocs),
+            (unsigned long long)(R.descriptorLookups - lastDescLookups), (unsigned long long)(shaderLookups - lastLookups),
+            (unsigned long long)(R.surfaceEpoch - lastEpoch), (unsigned long long)(R.surfaceImageDestroys - lastDestroys),
+            (unsigned long long)(R.surfaces.size() - lastSurfaces),
+            (unsigned long long)(R.asyncSkippedDraws - lastSkipped), vk::pending_shader_compiles());
+    }
+    lastDraws = drawCalls; lastDescAllocs = R.descriptorAllocations; lastDescLookups = R.descriptorLookups;
+    lastLookups = shaderLookups; lastEpoch = R.surfaceEpoch; lastDestroys = R.surfaceImageDestroys;
+    lastSurfaces = R.surfaces.size(); lastSkipped = R.asyncSkippedDraws;
+    lastIdle = idleNs; lastSync = syncNs;
+    lastTick = tick; lastMain = mainNs; lastRender = renderNs; lastRecord = recordNs;
+    lastUploads = g_stat_uploads; lastUploadNs = g_upload_ns; lastChecks = g_stat_full_checks;
+    lastCheckNs = g_full_check_ns; lastCompiles = compiles; lastPipes = R.pipelineCreates;
+  }
+#endif
   if (perf_enabled() || cpu_only_stats_enabled()) {
     static auto start = std::chrono::steady_clock::now();
     static auto previousSwap = start;
@@ -1331,11 +1581,13 @@ void swap() {
     static std::array<double, 120> swapIntervals{};
     static size_t intervalCount = 0, slowIntervals = 0;
     static uint64_t frame=0,draws=0,bytes=0,allocs=0,passes=0;
+    static uint64_t imageCreates=0,imageDestroys=0,imagePoolHits=0;
     static uint64_t descriptorLookups=0,descriptorHits=0,descriptorAllocations=0,descriptorFastHits=0;
     static uint64_t vertexDeclaredBytes=0,vertexCopiedBytes=0;
     static uint64_t vertexReuseChecks=0,vertexReuseHits=0,vertexReuseBytes=0,vertexReuseCompareNs=0;
     static uint64_t batchSubmissions=0,fetchLookups=0,fetchLastHits=0;
     static uint64_t stateHashLookups=0,stateHashMemoHits=0,stateHashBytes=0;
+    static uint64_t pairLookups=0,pairHits=0,pairStateHits=0,fetchRangeHits=0;
     static uint64_t vertexBindCalls=0,vertexBindSkips=0;
     static uint64_t vertexHistoryRequests=0,vertexHistoryMatches=0,vertexHistoryBytes=0;
     static uint64_t vertexHistoryReuseChecks=0,vertexHistoryReuseHits=0,vertexHistoryReuseBytes=0;
@@ -1343,6 +1595,9 @@ void swap() {
     static Renderer::CpuPreparationStats previousPreparation;
     static SparseHashStats previousSparse;
     static gx2::ShaderKeyDirtyStats previousShaderDirty;
+#if defined(__SWITCH__) && !defined(CLOCK_THREAD_CPUTIME_ID)
+#define CLOCK_THREAD_CPUTIME_ID CLOCK_MONOTONIC  // statistics only: newlib has no per-thread CPU clock
+#endif
 #ifndef _WIN32
     auto threadCpuNs = []() -> uint64_t {
       timespec time{};
@@ -1378,6 +1633,18 @@ void swap() {
         LOG("[vulkan pacing] %llu intervals p50 %.2f ms p95 %.2f ms max %.2f ms; >40 ms %llu",
             (unsigned long long)intervalCount,swapIntervals[p50],swapIntervals[p95],
             swapIntervals[intervalCount-1],(unsigned long long)slowIntervals);
+#ifdef __SWITCH__
+        static uint64_t lastFlushBumps = 0, lastInvalidateBumps = 0;
+        const uint64_t fb = gx2::shaderProgramWrites.flushBumps.load(), ib = gx2::shaderProgramWrites.invalidateBumps.load();
+        static uint64_t lastContent = 0;
+        const uint64_t cb = gx2::shaderProgramWrites.contentBumps.load();
+        LOG("[vulkan shader epoch] %llu bumps (%llu real program changes); %llu flushes of watched pages",
+            (unsigned long long)(ib - lastInvalidateBumps), (unsigned long long)(cb - lastContent), (unsigned long long)(fb - lastFlushBumps));
+        lastFlushBumps = fb; lastInvalidateBumps = ib; lastContent = cb;
+#endif
+        static uint64_t lastEpoch = 0;
+        LOG("[vulkan epoch] %llu surface epoch bumps", (unsigned long long)(R.surfaceEpoch - lastEpoch));
+        lastEpoch = R.surfaceEpoch;
       }
       intervalCount=0;slowIntervals=0;
       auto ss=vk::shader_stats();
@@ -1403,9 +1670,26 @@ void swap() {
       // CPU-only reports leave per-draw counters/comparison clocks disabled.
       if (perf_enabled()) {
       double frames = double(R.frame-frame);
+      LOG("[vulkan surface images] %.2f creates/frame %.2f destroys/frame %.2f pool hits/frame; %zu retired images %.2f MiB pooled; %zu guest surfaces",
+          (R.surfaceImageCreates-imageCreates)/frames,(R.surfaceImageDestroys-imageDestroys)/frames,
+          (R.surfaceImagePoolHits-imagePoolHits)/frames,R.surfaceImagePool.size(),
+          double(R.surfaceImagePoolBytes)/(1<<20),R.surfaces.size());
+      imageCreates=R.surfaceImageCreates;imageDestroys=R.surfaceImageDestroys;imagePoolHits=R.surfaceImagePoolHits;
       LOG("[vulkan fetch memo] %.1f lookups/frame %.1f last hits/frame",
           (ss.fetchLookups-fetchLookups)/frames,(ss.fetchLastHits-fetchLastHits)/frames);
       fetchLookups=ss.fetchLookups;fetchLastHits=ss.fetchLastHits;
+      LOG("[vulkan shader pair memo] %.1f lookups/frame %.1f hits/frame %.1f state gathers skipped/frame; %.1f fetch range hits/frame; %llu states %llu pairs %.3f MiB",
+          (ss.pairLookups-pairLookups)/frames,(ss.pairHits-pairHits)/frames,
+          (ss.pairStateHits-pairStateHits)/frames,(ss.fetchRangeHits-fetchRangeHits)/frames,
+          (unsigned long long)ss.pairStates,(unsigned long long)ss.pairEntries,ss.pairCacheBytes/double(1<<20));
+      pairLookups=ss.pairLookups;pairHits=ss.pairHits;pairStateHits=ss.pairStateHits;fetchRangeHits=ss.fetchRangeHits;
+      static uint64_t supportChecks=0,supportHits=0,supportBytes=0;
+      LOG("[vulkan support upload reuse] %.1f checks/frame %.1f hits/frame %.3f MiB avoided/frame",
+          (R.cpuPreparation.supportReuseChecks-supportChecks)/frames,
+          (R.cpuPreparation.supportReuseHits-supportHits)/frames,
+          (R.cpuPreparation.supportReuseBytes-supportBytes)/frames/(1<<20));
+      supportChecks=R.cpuPreparation.supportReuseChecks;supportHits=R.cpuPreparation.supportReuseHits;
+      supportBytes=R.cpuPreparation.supportReuseBytes;
       LOG("[vulkan state hash memo] %.1f lookups/frame %.1f hits/frame %.3f MiB hashed/frame",
           (ss.stateHashLookups-stateHashLookups)/frames,
           (ss.stateHashMemoHits-stateHashMemoHits)/frames,
@@ -1459,6 +1743,13 @@ void swap() {
       descriptorLookups=R.descriptorLookups;descriptorHits=R.descriptorCacheHits;
       descriptorAllocations=R.descriptorAllocations;descriptorFastHits=R.descriptorFastHits;
       const auto& prep=R.cpuPreparation;
+      LOG("[vulkan state reuse] skipped/frame: fetch %.1f shader pairs %.1f targets %.1f textures %.1f views %.1f pipelines %.1f",
+          (prep.fetchSkips-previousPreparation.fetchSkips)/frames,
+          (prep.shaderSkips-previousPreparation.shaderSkips)/frames,
+          (prep.targetSkips-previousPreparation.targetSkips)/frames,
+          (prep.textureSkips-previousPreparation.textureSkips)/frames,
+          (prep.viewSkips-previousPreparation.viewSkips)/frames,
+          (prep.pipelineSkips-previousPreparation.pipelineSkips)/frames);
       const auto sparse=sparse_hash_stats();
       LOG("[vulkan sparse hash memo] %.1f checks/frame %.1f hits/frame %.3f MiB fresh samples/frame %.1f mixed words/frame %.1f overflow/frame",
           (sparse.checks-previousSparse.checks)/frames,
@@ -1467,6 +1758,7 @@ void swap() {
           (sparse.mixerWords-previousSparse.mixerWords)/frames,
           (sparse.overflows-previousSparse.overflows)/frames);
       previousSparse=sparse;
+      gx2::log_bump_regs(uint64_t(frames));
       const auto dirty=gx2::shader_key_dirty_stats();
       LOG("[vulkan shader key dirty] %.1f changed batches/frame %.1f baseline bumps/frame %.1f actual bumps/frame %.1f avoided/frame %.1f masked words/frame",
           (dirty.changedBatches-previousShaderDirty.changedBatches)/frames,
@@ -1802,6 +2094,10 @@ static void init_device(std::vector<const char *> extensions,
       de.push_back(VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME);
     }
   }
+#ifdef __SWITCH__
+  const bool hostImport = has_extension(des, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+  if (hostImport) de.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+#endif
   if (has_extension(des, "VK_KHR_portability_subset"))
     de.push_back("VK_KHR_portability_subset");
   R.portabilitySubset =
@@ -1883,6 +2179,9 @@ static void init_device(std::vector<const char *> extensions,
            "create Vulkan device");
   load_device_functions(R.device, R.dynamicRenderingKHR);
   vkGetDeviceQueue(R.device, R.queueFamily, 0, &R.queue);
+#ifdef __SWITCH__
+  if (hostImport) import_guest_mem2();
+#endif
   init_pipeline_cache();
   for (auto& slot:R.submissions) {
   VkCommandPoolCreateInfo pool{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -1911,18 +2210,16 @@ static void init_device(std::vector<const char *> extensions,
   dp.pPoolSizes = sizes;
   vk_check(vkCreateDescriptorPool(R.device, &dp, nullptr, &slot.descriptorPool),
            "create descriptor pool");
+  VkSemaphoreCreateInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+  for (size_t screen=0;screen<slot.acquired.size();++screen)
+    if ((screen ? R.drc : R.tv).window)
+      vk_check(vkCreateSemaphore(R.device,&si,nullptr,&slot.acquired[screen]),
+               "create acquire semaphore");
   }
   init_gpu_timestamp_queries();
   activate_submission(0);
   for (Screen *s : {&R.tv, &R.drc})
-    if (s->window) {
-      VkSemaphoreCreateInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
-      vk_check(vkCreateSemaphore(R.device, &si, nullptr, &s->acquired),
-               "create acquire semaphore");
-      vk_check(vkCreateSemaphore(R.device, &si, nullptr, &s->finished),
-               "create present semaphore");
-      make_swapchain(*s);
-    }
+    if (s->window) make_swapchain(*s);
   vk::select_renderer();
   set_graphics_feature_available(GraphicsFeature::AO);
   set_graphics_feature_available(GraphicsFeature::AOHires);
@@ -1979,6 +2276,7 @@ void init() {
     throw std::runtime_error(SDL_GetError());
   // the Vulkan loader (vulkan-1.dll, libvulkan.so.1), loaded here rather than imported (loader.h); the
   // windows below use the same one
+#ifndef __SWITCH__  // the Switch links its Vulkan driver (loader.h)
   if (!SDL_Vulkan_LoadLibrary(nullptr))
     throw std::runtime_error(std::string("Vulkan is not installed on this computer: the Vulkan runtime "
 #ifdef _WIN32
@@ -1986,6 +2284,7 @@ void init() {
 #endif
                                          "could not be loaded (") + SDL_GetError() + ").\n\n" + kUpdateDriver);
   load_global_functions(reinterpret_cast<PFN_vkGetInstanceProcAddr>(SDL_Vulkan_GetVkGetInstanceProcAddr()));
+#endif
 #ifdef __ANDROID__
   SDL_AddEventWatch(lifecycle_watch, nullptr);
   const SDL_WindowFlags windowFlags = SDL_WINDOW_VULKAN | SDL_WINDOW_FULLSCREEN;
@@ -2046,6 +2345,7 @@ void save_renderer_caches() {
   // Called during orderly shutdown under the renderer execution lock.
   reset_feedback_images();
   wait_idle();
+  reset_surface_image_pool();
   destroy_gpu_timestamp_queries();
   vk::save_shader_cache();
   save_pipeline_cache();

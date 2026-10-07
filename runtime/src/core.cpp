@@ -89,8 +89,14 @@ void fatal(const char* fmt, ...) {
 namespace mem {
 static std::atomic<uint32_t> g_runtime_top{kRuntimeStart};
 
+#ifdef __SWITCH__
+uint8_t* switch_map_guest_memory();  // platform/switch/switch_host.cpp
+extern "C" void switch_set_mem_base(uint8_t* base);
+#endif
 void init() {
-#ifdef __APPLE__
+#if defined(__SWITCH__)
+    switch_set_mem_base(switch_map_guest_memory());
+#elif defined(__APPLE__)
     mach_vm_address_t addr = (mach_vm_address_t)PPC_MEM_BASE;
     kern_return_t kr = mach_vm_allocate(mach_task_self(), &addr, 0x100000000ull, VM_FLAGS_FIXED);
     if (kr != KERN_SUCCESS) fatal("cannot reserve guest address space at %p (kr=%d)", PPC_MEM_BASE, kr);
@@ -174,10 +180,19 @@ void write_cstr(uint32_t ea, const std::string& s, uint32_t max) {
 static uint32_t be32(const uint8_t* p) { return (uint32_t)p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3]; }
 static uint16_t be16(const uint8_t* p) { return (uint16_t)(p[0] << 8 | p[1]); }
 
+#ifdef __SWITCH__
+bool wua_read_file(const std::string& host, std::vector<uint8_t>& out);  // hle/fs.cpp
+#endif
 bool load_rpx(const std::string& path, LoadedModule& out) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) return false;
-    std::vector<uint8_t> d((std::istreambuf_iterator<char>(f)), {});
+    std::vector<uint8_t> d;
+#ifdef __SWITCH__
+    if (!wua_read_file(path, d))
+#endif
+    {
+        std::ifstream f(path, std::ios::binary);
+        if (!f) return false;
+        d.assign(std::istreambuf_iterator<char>(f), {});
+    }
     uint32_t shoff = be32(&d[0x20]);
     uint16_t shentsize = be16(&d[0x2E]), shnum = be16(&d[0x30]);
     out.entry = be32(&d[0x18]);
@@ -215,10 +230,11 @@ bool load_rpx(const std::string& path, LoadedModule& out) {
 }
 
 // ---------------------------------------------------------------- dispatch
+uint32_t g_ppc_dispatch_epoch = 1;
 namespace dispatch {
 static constexpr uint32_t kTextBase = 0x02000000;
 static constexpr uint32_t kTextSize = 0x01000000;  // 16 MiB covers cking.rpx .text
-static PpcFunc* g_text_table;                        // indexed by (addr - kTextBase) / 4
+static std::atomic<PpcFunc>* g_text_table;           // indexed by (addr - kTextBase) / 4
 // lock-free direct tables for import slots and host functions (called through pointers a lot)
 static constexpr uint32_t kSlotBase = 0xC0000000, kSlotSize = 0x40000;     // import stubs, 4-byte steps
 static constexpr uint32_t kHostSize = 0x80000;                              // host functions, 8-byte steps
@@ -229,8 +245,16 @@ static std::shared_mutex g_other_mutex;
 static std::atomic<uint32_t> g_next_host{mem::kHleFuncBase};
 static std::unordered_map<uint32_t, std::string> g_host_names;
 
+static void invalidate_caches(PpcFunc previous, PpcFunc fn) {
+    // A missing target cannot have been cached: resolution would have aborted.
+    // In particular, registering a new host callback need not cool every site.
+    if (previous && previous != fn)
+        __atomic_add_fetch(&g_ppc_dispatch_epoch, 1u, __ATOMIC_RELEASE);
+}
+
 void init() {
-    g_text_table = (PpcFunc*)calloc(kTextSize / 4, sizeof(PpcFunc));
+    g_text_table = new std::atomic<PpcFunc>[kTextSize / 4]{};
+    __atomic_add_fetch(&g_ppc_dispatch_epoch, 1u, __ATOMIC_RELEASE);
     for (unsigned i = 0; i < g_recomp_func_count; i++) set(g_recomp_funcs[i].addr, g_recomp_funcs[i].fn);
     // imported functions are reachable through their import slot addresses
     for (unsigned i = 0; i < g_recomp_import_count; i++)
@@ -239,17 +263,28 @@ void init() {
 
 void set(uint32_t addr, PpcFunc fn) {
     if (addr - kTextBase < kTextSize) {
-        g_text_table[(addr - kTextBase) >> 2] = fn;
+        PpcFunc previous = g_text_table[(addr - kTextBase) >> 2].exchange(fn, std::memory_order_relaxed);
+        invalidate_caches(previous, fn);
         return;
     }
-    if (addr - kSlotBase < kSlotSize && !(addr & 3)) { g_slot_table[(addr - kSlotBase) >> 2] = fn; return; }
-    if (addr - mem::kHleFuncBase < kHostSize && !(addr & 7)) { g_host_table[(addr - mem::kHleFuncBase) >> 3] = fn; return; }
+    if (addr - kSlotBase < kSlotSize && !(addr & 3)) {
+        PpcFunc previous = g_slot_table[(addr - kSlotBase) >> 2].exchange(fn, std::memory_order_relaxed);
+        invalidate_caches(previous, fn);
+        return;
+    }
+    if (addr - mem::kHleFuncBase < kHostSize && !(addr & 7)) {
+        PpcFunc previous = g_host_table[(addr - mem::kHleFuncBase) >> 3].exchange(fn, std::memory_order_relaxed);
+        invalidate_caches(previous, fn);
+        return;
+    }
     std::unique_lock lk(g_other_mutex);
+    PpcFunc previous = g_other[addr];
     g_other[addr] = fn;
+    invalidate_caches(previous, fn);
 }
 
 PpcFunc lookup(uint32_t addr) {
-    if (addr - kTextBase < kTextSize) return g_text_table[(addr - kTextBase) >> 2];
+    if (addr - kTextBase < kTextSize) return g_text_table[(addr - kTextBase) >> 2].load(std::memory_order_relaxed);
     if (addr - kSlotBase < kSlotSize && !(addr & 3)) return g_slot_table[(addr - kSlotBase) >> 2].load(std::memory_order_relaxed);
     if (addr - mem::kHleFuncBase < kHostSize && !(addr & 7))
         return g_host_table[(addr - mem::kHleFuncBase) >> 3].load(std::memory_order_relaxed);
@@ -274,9 +309,29 @@ uint32_t register_host(PpcFunc fn, const char* name) {
 }
 }  // namespace dispatch
 
-extern "C" void ppc_dispatch(Cpu* c) {
+extern "C" PpcFunc ppc_resolve(Cpu* c) {
     PpcFunc f = dispatch::lookup(c->pc);
     if (!f) fatal("indirect branch to unknown address %08X (lr=%08X ctr=%08X)", c->pc, c->lr, c->ctr);
+    return f;
+}
+
+extern "C" PpcFunc ppc_resolve_cached(Cpu* c, PpcCallCache* cache, uint32_t epoch) {
+    uint32_t target = c->pc;
+    PpcFunc fn = ppc_resolve(c);
+    cache->target = target;
+    cache->epoch = epoch;
+    cache->fn = fn;
+    return fn;
+}
+
+extern "C" PpcCallCache* ppc_icache_alloc(void) {
+    auto* caches = static_cast<PpcCallCache*>(calloc(std::max<uint32_t>(g_ppc_icache_sites, 1), sizeof(PpcCallCache)));
+    if (!caches) fatal("no memory for %u indirect call caches", g_ppc_icache_sites);
+    return caches;
+}
+
+extern "C" void ppc_dispatch(Cpu* c) {
+    PpcFunc f = ppc_resolve(c);
     MUSTTAIL return f(c);
 }
 

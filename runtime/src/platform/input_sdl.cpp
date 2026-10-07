@@ -593,8 +593,19 @@ static void apply_scenario(PadState& s) {
         if (t >= p.from && t < p.to) s.buttons |= p.bits;
 }
 
-static std::atomic<bool> g_pro{getenv("WWHD_PRO_CONTROLLER") != nullptr};
-bool pro_controller() { return g_pro.load(std::memory_order_relaxed); }
+// WWHD_PRO_CONTROLLER (any value but 0) starts in Pro Controller mode; read on first use, after the
+// platform has set its defaults (the Switch has no GamePad screen, so it defaults to on)
+static std::atomic<int> g_pro{-1};
+bool pro_controller() {
+    int v = g_pro.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char* e = getenv("WWHD_PRO_CONTROLLER");
+        v = e && strcmp(e, "0") != 0;
+        g_pro.store(v, std::memory_order_relaxed);
+        LOG("[input] keyboard/controller act as %s", v ? "Pro Controller" : "GamePad");
+    }
+    return v;
+}
 void set_pro_controller(bool on) { g_pro = on; LOG("[input] keyboard/controller act as %s", on ? "Pro Controller" : "GamePad"); }
 
 PadState read() {
@@ -633,6 +644,17 @@ PadState read() {
         LOG("[input] frame %llu buttons %04X", (unsigned long long)render::frame_count(), s.buttons);
         last_buttons = s.buttons;
     }
+#ifdef __SWITCH__
+    // L3 + R3 together turns the performance overlay (fps, frame time) on or off; that press does
+    // not reach the game
+    {
+        static bool combo = false;
+        const bool both = (s.buttons & kStickL) && (s.buttons & kStickR);
+        if (both && !combo) overlay::set_perf_shown(!overlay::perf_shown());
+        combo = both || (combo && (s.buttons & (kStickL | kStickR)));
+        if (combo) s.buttons &= ~uint32_t(kStickL | kStickR);
+    }
+#endif
     mods::filter_pad(s);  // gameplay mods: mouse camera, wheel -> R3
     if (overlay::blocks_input()) s = PadState{};  // the settings overlay has the input
     return s;

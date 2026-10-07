@@ -254,11 +254,17 @@ HLE(coreinit, memmove) { memmove(mem::ptr(arg(c, 0)), mem::ptr(arg(c, 1)), arg(c
 HLE(coreinit, memset) { memset(mem::ptr(arg(c, 0)), (int)arg(c, 1), arg(c, 2)); ret(c, arg(c, 0)); }
 
 // caches are coherent on the host
-HLE(coreinit, DCFlushRange) {}
-HLE(coreinit, DCFlushRangeNoSync) {}
+#ifdef __SWITCH__
+extern "C" void switch_dc_store(const void* p, size_t size);  // platform/switch/switch_host.cpp
+#define DC_STORE(c) switch_dc_store(mem::ptr(arg(c, 0)), arg(c, 1))
+#else
+#define DC_STORE(c) ((void)0)
+#endif
+HLE(coreinit, DCFlushRange) { DC_STORE(c); }
+HLE(coreinit, DCFlushRangeNoSync) { DC_STORE(c); }
 HLE(coreinit, DCInvalidateRange) {}
-HLE(coreinit, DCStoreRange) {}
-HLE(coreinit, DCStoreRangeNoSync) {}
+HLE(coreinit, DCStoreRange) { DC_STORE(c); }
+HLE(coreinit, DCStoreRangeNoSync) { DC_STORE(c); }
 HLE(coreinit, DCZeroRange) { memset(mem::ptr(arg(c, 0) & ~31u), 0, ((arg(c, 0) & 31) + arg(c, 1) + 31) & ~31u); }
 HLE(coreinit, OSIsAddressRangeDCValid) { ret(c, 1); }
 

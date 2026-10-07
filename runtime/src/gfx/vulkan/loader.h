@@ -5,6 +5,16 @@
 // defines VK_NO_PROTOTYPES; these pointers, in namespace gfxvk, carry the usual names, so the
 // renderer calls vkCmdDraw(...) as before.
 #pragma once
+#ifdef __SWITCH__
+// The Switch has no Vulkan loader: the build links Mesa NVK directly, and a generated shim
+// (tools/switch/gen_vk_switch.py) defines the entry points the renderer uses under their usual names.
+#include <vulkan/vulkan.h>
+namespace gfxvk {
+inline void load_global_functions(PFN_vkGetInstanceProcAddr) {}
+inline void load_instance_functions(VkInstance) {}
+inline void load_device_functions(VkDevice, bool) {}
+}  // namespace gfxvk
+#else
 #ifndef VK_NO_PROTOTYPES
 #error "the Vulkan renderer is built with VK_NO_PROTOTYPES (CMakeLists.txt)"
 #endif
@@ -64,3 +74,4 @@ void load_instance_functions(VkInstance instance);
 // khrDynamicRendering: VK_KHR_dynamic_rendering is enabled (the device is older than Vulkan 1.3)
 void load_device_functions(VkDevice device, bool khrDynamicRendering);
 }  // namespace gfxvk
+#endif  // __SWITCH__

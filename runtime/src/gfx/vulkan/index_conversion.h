@@ -2,14 +2,13 @@
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
+#include <span>
 #include <vector>
 
 namespace gfxvk::vk {
 // Emit the same uint32 stream as the original draw conversion. Native guest
 // indices remain on their existing upload path; this helper owns no GPU state.
-template<class Read>
-void expand_indices(uint32_t prim, uint32_t count, bool indexed,
-                    Read read, std::vector<uint32_t>& out) {
+inline size_t converted_index_count(uint32_t prim, uint32_t count, bool indexed) {
   size_t n = indexed ? size_t(count) : 0;
   switch (prim) {
   case 5: n = count > 2 ? size_t(count - 2) * 3 : 0; break;
@@ -21,7 +20,19 @@ void expand_indices(uint32_t prim, uint32_t count, bool indexed,
   }
   // Preserve the original empty-conversion indexed fallback (short fan).
   if (!n && indexed) n = count;
-  out.resize(n);
+  return n;
+}
+inline void resize_indices(std::vector<uint32_t>& out, size_t n) { out.resize(n); }
+inline void resize_indices(std::span<uint32_t>& out, size_t n) {
+  if (out.size() != n) throw std::runtime_error("incorrect index output size");
+}
+// A span writes directly to an owned upload slice, without value-initializing
+// or copying an intermediate vector. Both outputs use exactly the same reader.
+template<class Read, class Output>
+void expand_indices(uint32_t prim, uint32_t count, bool indexed,
+                    Read read, Output& out) {
+  const size_t n = converted_index_count(prim, count, indexed);
+  resize_indices(out, n);
   size_t o = 0;
   if (prim == 5 && count > 2) {
     const auto a = read(0); auto b = read(1);
@@ -49,9 +60,9 @@ void expand_indices(uint32_t prim, uint32_t count, bool indexed,
     for (size_t i = 0; i < n; ++i) out[i] = read(uint32_t(i));
   }
 }
-template<class Word, bool BigEndian, bool Restart>
+template<class Word, bool BigEndian, bool Restart, class Output>
 void convert_index_words(const void* data, uint32_t prim, uint32_t count,
-                         uint32_t marker, std::vector<uint32_t>& out) {
+                         uint32_t marker, Output& out) {
   const auto* bytes = static_cast<const uint8_t*>(data);
   auto read = [&](uint32_t i) {
     Word word; std::memcpy(&word, bytes + size_t(i) * sizeof(Word), sizeof(Word));
@@ -65,9 +76,10 @@ void convert_index_words(const void* data, uint32_t prim, uint32_t count,
   };
   expand_indices(prim, count, true, read, out);
 }
+template<class Output>
 inline void convert_indices(const void* data, uint32_t prim, uint32_t count,
                             uint32_t type, bool restart, uint32_t marker,
-                            std::vector<uint32_t>& out) {
+                            Output& out) {
   if (!data) {
     expand_indices(prim, count, false, [](uint32_t i) { return i; }, out);
     return;

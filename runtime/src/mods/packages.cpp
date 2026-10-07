@@ -172,7 +172,7 @@ const Value& option(void* c,const char* id){return static_cast<Context*>(c)->con
 void unload(Live& item){if(item.initialized&&item.api.on_unload)item.api.on_unload(item.api.instance);for(const auto& [id,on]:item.previous)if(const auto* e=manager::find(id))e->apply(on);if(item.library){
 #ifdef _WIN32
     FreeLibrary(static_cast<HMODULE>(item.library));
-#else
+#elif !defined(__SWITCH__)
     dlclose(item.library);
 #endif
 }item.library=nullptr;}
@@ -184,6 +184,9 @@ void load(Live& item,const Record& record,const Value& configuration){
     auto path=record.path/record.manifest.binary;
 #ifdef _WIN32
     item.library=LoadLibraryW(path.wstring().c_str());require(item.library,"Cannot load native mod library");auto init=reinterpret_cast<WWHDModInitV1>(GetProcAddress(static_cast<HMODULE>(item.library),"wwhd_mod_init_v1"));
+#elif defined(__SWITCH__)
+    // homebrew cannot load native code at run time: settings and content mods only
+    WWHDModInitV1 init=nullptr;(void)path;
 #else
     item.library=dlopen(path.c_str(),RTLD_NOW|RTLD_LOCAL);if(!item.library){const char* reason=dlerror();throw std::runtime_error(reason?reason:"Cannot load native library");}auto init=reinterpret_cast<WWHDModInitV1>(dlsym(item.library,"wwhd_mod_init_v1"));
 #endif

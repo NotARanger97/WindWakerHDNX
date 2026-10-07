@@ -120,6 +120,7 @@ struct PresentCapture {
  uint64_t frame=0;
  bool enabled=false,done=false;
  Buffer buffer{};
+ uint64_t submission=0;
  VkExtent2D extent{};
  VkFormat format=VK_FORMAT_UNDEFINED;
 };
@@ -438,6 +439,7 @@ namespace {
 struct Signature {
  VkImage mip=VK_NULL_HANDLE,signatureImage=VK_NULL_HANDLE;VkDeviceMemory mipMemory=VK_NULL_HANDLE,smallMemory=VK_NULL_HANDLE;
  uint32_t width=0,height=0,levels=0;Buffer buffer{};bool pending=false,linear=false;
+ uint64_t submission=0;
 };
 Signature signatures[2];
 void make_image(VkImage& image,VkDeviceMemory& memory,uint32_t w,uint32_t h,uint32_t levels) {
@@ -461,7 +463,7 @@ bool record_signature(int slot,Surface& source,bool sourceLinear) {
  auto& g=signatures[slot];
  const uint32_t w=source.extent.width,h=source.extent.height;
  if(g.width!=w||g.height!=h||!g.mip) {
-  if(g.mip){vkDestroyImage(R.device,g.mip,nullptr);vkFreeMemory(R.device,g.mipMemory,nullptr);g.mip=VK_NULL_HANDLE;}
+  if(g.mip){defer_surface_image(g.mip,g.mipMemory,{});g.mip=VK_NULL_HANDLE;}
   uint32_t levels=1;while((w>>levels)>=uint32_t(gfx::kSignatureW)&&(h>>levels)>=1)levels++;
   make_image(g.mip,g.mipMemory,w,h,levels);g.width=w;g.height=h;g.levels=levels;
  }
@@ -497,12 +499,14 @@ bool record_signature(int slot,Surface& source,bool sourceLinear) {
  vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,0,nullptr,1,&host,0,nullptr);
  // the blits decode sRGB images to linear values: encode them like the Metal path does
  g.linear=sourceLinear||srgb_format(source.fmt.pixel);g.pending=true;
+ g.submission=recording_submission();
  return true;
 }
-// after the frame's work completed: display-encoded luma, or empty
+// Wait only for the submission containing the signature's GPU-to-host copy.
 std::vector<float> read_signature(int slot) {
  auto& g=signatures[slot];
  if(!g.pending)return {};
+ wait_submission(g.submission);
  g.pending=false;
  const auto* px=static_cast<const uint8_t*>(g.buffer.mapped);
  std::vector<float> v(gfx::kSignatureW*gfx::kSignatureH);
@@ -516,8 +520,8 @@ std::vector<float> read_signature(int slot) {
 }
 void reset_signatures() {
  for(auto& g:signatures) {
-  if(g.mip){vkDestroyImage(R.device,g.mip,nullptr);vkFreeMemory(R.device,g.mipMemory,nullptr);}
-  if(g.signatureImage){vkDestroyImage(R.device,g.signatureImage,nullptr);vkFreeMemory(R.device,g.smallMemory,nullptr);}
+  if(g.mip)defer_surface_image(g.mip,g.mipMemory,{});
+  if(g.signatureImage)defer_surface_image(g.signatureImage,g.smallMemory,{});
   if(g.buffer.buffer)defer_buffer(g.buffer);
   g=Signature{};
  }
@@ -558,6 +562,7 @@ void record_present_capture(Screen& screen,uint32_t imageIndex) {
   image.srcAccessMask=VK_ACCESS_TRANSFER_READ_BIT;image.dstAccessMask=0;
   vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,0,0,nullptr,0,nullptr,1,&image);
   screen.layouts[imageIndex]=image.newLayout;
+  capture.submission=recording_submission();
  }catch(const std::exception& error) {
   if(capture.buffer.buffer){defer_buffer(capture.buffer);capture.buffer={};}
   std::fprintf(stderr,"[vulkan present] capture failed: %s\n",error.what());
@@ -565,8 +570,9 @@ void record_present_capture(Screen& screen,uint32_t imageIndex) {
 }
 void finish_present_capture(Screen& screen) {
  auto& capture=present_capture();if(&screen!=&R.tv||!capture.buffer.buffer)return;
- // Called after normal submit waited for its fence. Swapchain acquire was
- // waited in that same submission, and finished semaphore remains for present.
+ // The normal present submission is asynchronous on Switch. Its fence covers
+ // this host copy (and the acquire wait), but not the later present wait.
+ wait_submission(capture.submission);
  try {
   const size_t count=size_t(capture.extent.width)*capture.extent.height;
   const auto* raw=static_cast<const uint8_t*>(capture.buffer.mapped);std::vector<uint8_t> rgba(count*4);

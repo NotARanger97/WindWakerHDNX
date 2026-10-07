@@ -44,7 +44,7 @@ filter), and `gfx/vulkan/present.cpp` draws it. The TV window title starts with 
 | Climb mod stamina wheel | yes | yes (ported shader; not yet seen in a test run) |
 | Frame dumps `WWHD_DUMP_FRAMES`, `WWHD_DUMP_PRESENT` | yes | yes |
 | Capture frame (P) | pictures + draw log | pictures only (no draw log) |
-| Shader head start (`--warm-shaders`) | yes | no (Vulkan keeps its own SPIR-V / pipeline caches) |
+| Shader head start (`--warm-shaders`) | yes | no; previously seen variants warm automatically at boot |
 
 Other builds: `-DWWHD_RENDERER=METAL` (Metal only, no Vulkan dependencies) and
 `-DWWHD_RENDERER=VULKAN` (Vulkan only with the portable SDL3 host: SDL windows, input and audio;
@@ -131,6 +131,10 @@ an isolated directory; `WWHD_VK_SHADER_CACHE=0` disables disk storage. An explic
 directory overrides `WWHD_SHADER_CACHE=0`. Canonical GLSL and stage deduplication
 remains active in memory when disk storage is disabled. Fresh decompiler metadata
 is kept for every guest variant; identical final shader programs share compilation.
+Previously recorded variants are translated before the game thread starts, with
+their SPIR-V reused from disk. `WWHD_VK_SHADER_WARMUP=0` disables this boot replay
+on both Switch and desktop. See [shader warm-up](vulkan-shader-warmup.md) for input
+coverage, limits, migration and CPU regressions.
 
 The versioned cache checks the compiler recipe, exact shader source, checksum,
 record bounds and SPIR-V structure. Incompatible or corrupt files become misses.
@@ -141,9 +145,9 @@ Completion is polled on the render thread. Shaders discovered during a save rema
 dirty for a later snapshot, and failed writes remain eligible for retry. Orderly
 window close joins any worker and saves the latest records before exiting. Forced
 termination can leave the most recent additions unsaved. Files and live canonical
-entries are bounded to 128 MiB. New programs compile once when
-encountered; this does not precompute every unvisited scene or warm all device
-pipelines before gameplay.
+entries (including input recipes) are bounded to 128 MiB. New programs compile
+once when encountered; replay covers previously visited variants within its boot
+budgets. Unvisited scenes and device pipelines are still prepared on demand.
 
 An isolated Outset startup through frame480 originally compiled 2,135 variants
 in 2.44 seconds. Deduplication compiled 412 distinct programs in 0.59 seconds;
@@ -176,8 +180,10 @@ these are historical measurements from before the later CPU fixes. The setting i
 
 ## Opt-in CPU experiments
 
-The following paths are off by default. Each requires its environment value
-to be exactly `1`; other values leave that path disabled. They can be combined,
+The following paths are off by default on desktop. Each requires its environment value
+to be exactly `1`; other values leave that path disabled. Switch enables the surface
+image pool and feedback image retention by default (explicit `0` disables either).
+They can be combined,
 but timing comparisons should use the same binary, guarded saved scene, graphics
 settings, warmed caches, and a quiet host, with validation disabled.
 
@@ -190,7 +196,8 @@ wait timers disabled. CPU time excludes sleeping and GPU waits.
 | Environment option | Scope and correctness constraints |
 | --- | --- |
 | `WWHD_VK_REUSE_UNIFORM_SNAPSHOTS` | Reuses immutable uniform slices after full fresh byte comparison within the same device/submission generation. Support uniforms are packed and texture/AO patches applied before lookup; allocation alignment and zero padding remain unchanged. |
-| `WWHD_VK_REUSE_FEEDBACK_IMAGES` | Retains compatible feedback-copy images in separate shader-stage/texture-unit slots, bounded to 128 MiB of retained image allocations. Every attachment alias still receives a fresh copy, with barriers preserving prior reads before overwrite. Replaced resources remain fence-retired. |
+| `WWHD_VK_REUSE_FEEDBACK_IMAGES` | Retains up to four compatible feedback-copy shapes per shader-stage/texture-unit slot, bounded to 128 MiB of retained image allocations. Every attachment alias still receives a fresh copy, with barriers preserving prior reads before overwrite. Overflow uses fence-retired temporaries. Default on Switch. |
+| `WWHD_VK_SURFACE_IMAGE_POOL` | Pools released image/memory pairs only after fence retirement, keyed by exact Vulkan format, extent, mips, layers, usage, image type and creation flags. Bounded to four images per key, 32 images total and 64 MiB, with oldest releases evicted first. Default on Switch. See [surface reuse](vulkan-surface-reuse.md). |
 | `WWHD_VK_SKIP_REDUNDANT_BINDS` | Omits only exact consecutive descriptor bindings, including layout, sets, dynamic offsets, command buffer, and submission generation. It can bind just the changed stage; resource preparation still runs. Pass changes reset the tracked state. |
 | `WWHD_VK_DESCRIPTOR_RANKS` | Precomputes descriptor binding ranks and compacts active writes/offsets in binding order. Invalid or duplicate metadata falls back to the original sorting path. |
 | `WWHD_VK_PIPELINE_LOOKASIDE` | Adds eight exact pipeline-key entries ahead of the existing map lookup. Full key comparison, device checks, and reset handling remain in place. |

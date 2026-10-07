@@ -144,13 +144,22 @@ void LatteShader_calculateFSKey(LatteFetchShader* fetchShader)
 void LatteFetchShader::CalculateFetchShaderVkHash()
 {
 	// patched: Vulkan pipeline hash is unused here; a plain FNV-1a over the attribute layout replaces SHA-1
+	// fields only: struct padding is not initialised by every parser, so hashing raw bytes made the
+	// value differ between runs (it keys the persisted pipeline warm-up recipes)
 	uint64 h = 1469598103934665603ull;
+	auto mix = [&](uint64 v) { h = (h ^ v) * 1099511628211ull; };
 	for (auto& group : bufferGroups)
+	{
+		mix(group.attributeBufferIndex);
 		for (sint32 f = 0; f < group.attribCount; f++)
 		{
-			const uint8* p = (const uint8*)&group.attrib[f];
-			for (size_t i = 0; i < sizeof(LatteParsedFetchShaderAttribute); i++) h = (h ^ p[i]) * 1099511628211ull;
+			const auto& a = group.attrib[f];
+			mix(a.attributeBufferIndex); mix(a.semanticId); mix((uint64)a.format); mix((uint64)a.fetchType);
+			mix(a.nfa); mix(a.isSigned); mix((uint64)a.endianSwap);
+			for (int k = 0; k < 4; k++) mix(a.ds[k]);
+			mix((uint32)a.aluDivisor); mix(a.offset);
 		}
+	}
 	this->vkPipelineHashFragment = h;
 }
 

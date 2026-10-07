@@ -56,8 +56,8 @@ def instrument(text, new_name, cov):
         out.append("    VM_COV(0, %d);" % nb)
         nb += 1
     for ln in lines[1:]:
-        # a hooked neighbour (runtime hook or recording tap) is reached as f_X_orig: same function
-        ln = re.sub(r"\bf_([0-9A-F]{8})_orig\(c\)", r"f_\1(c)", ln)
+        # Original/fast bodies share the guest address and the same call stub.
+        ln = re.sub(r"\bf_([0-9A-F]{8})_(?:orig|abi|sync)\(c\)", r"f_\1(c)", ln)
         out.append(ln)
         if not cov:
             continue

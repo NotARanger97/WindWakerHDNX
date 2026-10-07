@@ -11,7 +11,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
-#else
+#elif !defined(__SWITCH__)
 #include <signal.h>
 #include <sys/mman.h>
 #endif
@@ -42,6 +42,9 @@ bool set_rw(uint64_t first, uint64_t count, bool writable) {
 #ifdef _WIN32
     DWORD old;
     return VirtualProtect(p, n, writable ? PAGE_READWRITE : PAGE_READONLY, &old) != 0;
+#elif defined(__SWITCH__)
+    (void)p; (void)n; (void)writable;
+    return false;
 #else
     return mprotect(p, n, writable ? PROT_READ | PROT_WRITE : PROT_READ) == 0;
 #endif
@@ -78,6 +81,10 @@ LONG CALLBACK veh(EXCEPTION_POINTERS* e) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 bool install_handler() { return AddVectoredExceptionHandler(1, veh) != nullptr; }
+#elif defined(__SWITCH__)
+// Horizon gives homebrew no page protection with fault handling: the Switch renderer narrows texture
+// checks with the pages the game flushes from its data cache instead (gx2::texturePageWrites)
+bool install_handler() { return false; }
 #else
 struct sigaction g_old_segv, g_old_bus;
 void handler(int sig, siginfo_t* si, void* uc) {
@@ -118,6 +125,9 @@ bool page_range(uint32_t addr, uint32_t size, uint64_t& first, uint64_t& last) {
 bool init(uint8_t* base, uint64_t size) {
     static std::once_flag once;
     std::call_once(once, [&] {
+#ifdef __SWITCH__
+        return;  // see install_handler
+#endif
         size_t ps = host::page_size();
         if (!ps || (ps & (ps - 1))) return;
         unsigned shift = 0;

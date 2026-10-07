@@ -1,5 +1,6 @@
 // Vulkan entry points loaded at run time (loader.h).
 #include "loader.h"
+#ifndef __SWITCH__  // see loader.h
 #include <stdexcept>
 #include <string>
 
@@ -59,3 +60,4 @@ void load_device_functions(VkDevice device, bool khrDynamicRendering) {
 #undef WWHD_VK_LOAD
 }
 }  // namespace gfxvk
+#endif  // __SWITCH__

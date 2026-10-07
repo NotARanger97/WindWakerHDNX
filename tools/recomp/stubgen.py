@@ -74,6 +74,7 @@ def main(outdir):
         f.write("const RecompImport g_recomp_imports[] = {{0, 0, \"\", \"\", 0, 0}};\n")
         f.write("const unsigned g_recomp_import_count = 0;\n")
         f.write("const uint32_t g_recomp_entry_point = 0u; /* placeholder: matches no RPX */\n")
+        f.write("const uint32_t g_ppc_icache_sites = 0u;\n")
     with open(os.path.join(outdir, "imports.c"), "w") as f:
         f.write('#include "funcs.h"\n')
     with open(os.path.join(outdir, "report.txt"), "w") as f:

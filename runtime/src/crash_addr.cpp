@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstring>
 
+#ifndef __SWITCH__  // the Switch build has its own crash handler (main.cpp, switch_host.cpp)
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -157,3 +158,4 @@ void prime() {
 #endif
 
 }  // namespace crash_addr
+#endif  // __SWITCH__

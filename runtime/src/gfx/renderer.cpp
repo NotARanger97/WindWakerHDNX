@@ -191,8 +191,8 @@ void shutdown() {
 }
 
 bool restart() {
-#ifdef _WIN32
-    return false;
+#if defined(_WIN32) || defined(__SWITCH__)
+    return false;  // Switch: Vulkan is the only renderer
 #else
     std::string exe;
 #ifdef __APPLE__

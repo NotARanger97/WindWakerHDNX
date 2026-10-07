@@ -57,7 +57,7 @@ std::vector<uint8_t> read_rgba(Surface& source,bool encodeSrgb) {
   transition_image(&source,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_READ_BIT);
   VkBufferImageCopy region{};region.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};region.imageExtent={width,height,1};auto cmd=command_buffer();vkCmdCopyImageToBuffer(cmd,source.image,source.layout,buffer.buffer,1,&region);
   VkBufferMemoryBarrier barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};barrier.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_HOST_READ_BIT;barrier.srcQueueFamilyIndex=barrier.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;barrier.buffer=buffer.buffer;barrier.size=VK_WHOLE_SIZE;
-  vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,0,nullptr,1,&barrier,0,nullptr);flush();
+  vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,0,nullptr,1,&barrier,0,nullptr);flush_readback();
   const auto* raw=static_cast<const uint8_t*>(buffer.mapped);std::vector<uint8_t> rgba(count*4);
   for(size_t i=0;i<count;++i) {
    float color[3]{};const uint8_t* pixel=raw+i*bytes;

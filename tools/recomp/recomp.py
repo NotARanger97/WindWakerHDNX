@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 """Statically recompile a Wii U RPX into C.
 
-usage: recomp.py game/code/cking.rpx OUTDIR [--insns-per-file N]
+usage: recomp.py game/code/cking.rpx OUTDIR [--insns-per-file N] [--no-locals] [--no-abi]
+                 [--no-single-rounds] [--no-icache] [--no-sync-dataflow]
+                 [--no-dead-flags] [--no-leaf-inputs]
+
+Register locals are enabled by default; --no-locals or WWHD_RECOMP_LOCALS=0
+restores direct Cpu register accesses (regenerate code when changing this).
+ABI-aware synchronization is enabled by default; --no-abi or WWHD_RECOMP_ABI=0
+restores full call barriers while retaining the register cache.
 
 Output:
   OUTDIR/funcs.h         prototypes of every recompiled function and import
@@ -20,7 +27,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(__file__))
 from analyze import Program, sext
-from ppc2c import translate, Unhandled
+from ppc2c import translate, Unhandled, RegisterLocals, custom_abi, expand_cr_helpers, cpu_calls, single_rounds, leaf_inputs, dead_flags
 from rpx import R_PPC_ADDR16_HA, R_PPC_ADDR16_LO, R_PPC_ADDR16_HI
 
 
@@ -44,7 +51,26 @@ DATA_IMPORT_STRIDE = 0x1000
 
 
 class Recompiler:
-    def __init__(self, path):
+    def __init__(self, path, register_locals=None, abi=None, single_precision=None,
+                 indirect_cache=None, sync_dataflow=None, flag_liveness=None, leaf_read_inputs=None):
+        self.register_locals = (os.environ.get("WWHD_RECOMP_LOCALS", "1") != "0"
+                                if register_locals is None else register_locals)
+        self.abi = (os.environ.get("WWHD_RECOMP_ABI", "1") != "0" if abi is None else abi)
+        self.single_precision = (os.environ.get("WWHD_RECOMP_SINGLE_ROUNDS", "1") != "0"
+                                 if single_precision is None else single_precision)
+        self.indirect_cache = (os.environ.get("WWHD_RECOMP_ICACHE", "1") != "0"
+                               if indirect_cache is None else indirect_cache)
+        # Site caches in an array owned by the guest thread's Cpu (c->icache[site]) instead of
+        # host-thread-local variables: -mtp=soft makes every TLS access a __aarch64_read_tp call.
+        self.icache_in_cpu = os.environ.get("WWHD_RECOMP_ICACHE_TLS", "0") == "0"
+        self.icache_sites = {}
+        self.sync_dataflow = (os.environ.get("WWHD_RECOMP_SYNC_DATAFLOW", "1") != "0"
+                              if sync_dataflow is None else sync_dataflow)
+        self.flag_liveness = (os.environ.get("WWHD_RECOMP_DEAD_FLAGS", "1") != "0"
+                              if flag_liveness is None else flag_liveness)
+        self.leaf_read_inputs = (os.environ.get("WWHD_RECOMP_LEAF_INPUTS", "1") != "0"
+                                 if leaf_read_inputs is None else leaf_read_inputs)
+        self.used_imports = set()
         self.p = Program(path)
         self.p.discover()
         self.entries = set(self.p.entries)
@@ -64,7 +90,10 @@ class Recompiler:
         # "@ADDR": instruction-level hook; site_ADDR(c) runs just before the instruction at ADDR
         # (also when ADDR is reached by a branch), so it can adjust what that instruction uses
         self.sites = set()
-        for hp in [os.path.join(here, "hooks.txt")] + sorted(glob.glob(os.path.join(here, "hooks_*.txt"))):
+        hook_files = [os.path.join(here, "hooks.txt")] + sorted(glob.glob(os.path.join(here, "hooks_*.txt")))
+        if os.environ.get("WWHD_HOOKS"):  # another region: its own hook list (empty file = no hooks)
+            hook_files = [os.environ["WWHD_HOOKS"]]
+        for hp in hook_files:
             if not os.path.exists(hp):
                 continue
             for line in open(hp):
@@ -74,6 +103,130 @@ class Recompiler:
                 elif line:
                     self.hooks.add(int(line, 16))
         self._fixpoint()
+        self._analyze_abi()
+
+    def _analyze_abi(self):
+        """Prove leaf access/output contracts and legacy ABI eligibility.
+
+        Walk reachable instructions, including jump-table cases and tail edges.
+        The legacy _abi classification rejects any non-volatile access. Precise
+        _sync contracts cover those accesses without assuming preservation.
+        Reject nested guest entries so preemption cannot observe an ancestor's
+        stale Cpu fields. Unknown code/targets fail closed.
+        """
+        self.abi_safe = set()
+        self.abi_calls = frozenset()
+        self.call_summaries = {}
+        self.sync_safe = set()
+        if not (self.abi and self.register_locals):
+            return
+        unsafe = set(self.hooks)
+        for sym in self.p.rpx.symbols:
+            if custom_abi(sym.name):
+                unsafe.add(sym.value)
+        # Precise leaf contracts need no EABI preservation assumption: even an
+        # unnamed restore helper's non-volatile outputs are reloaded. The same
+        # entry/preemption restrictions as _abi apply to these fast bodies.
+        blocked = set(unsafe)
+        contracts = {}
+        import_accessed = {"c->r[%d]" % i for i in range(14)} | {
+            "c->cr[%d]" % i for i in range(32) if i < 8 or i >= 20} | {"c->lr", "c->ctr"}
+        import_modified = {f for f in import_accessed if RegisterLocals.volatile(f)}
+        for start in self.sorted_entries:
+            if start in unsafe:
+                continue
+            self.cur_start, self.cur_end = start, self.func_end(start)
+            self.labels = set()
+            accessed, modified = set(), set()
+            body = {}
+            seen, pending = set(), [start]
+            while pending:
+                addr = pending.pop()
+                if not start <= addr < self.cur_end:
+                    unsafe.add(start)  # fallthrough reaches a normal PPC_ENTER
+                    blocked.add(start)
+                    continue
+                if addr in seen:
+                    continue
+                seen.add(addr)
+                if addr in self.sites:
+                    unsafe.add(start)
+                    blocked.add(start)
+                w = self.p.word(addr)
+                try:
+                    src = expand_cr_helpers(translate(addr, w, self))
+                except (Unhandled, ValueError):
+                    unsafe.add(start)
+                    blocked.add(start)
+                    continue
+                body[addr] = (addr, w, src)
+                for m in RegisterLocals.field.finditer(src):
+                    accessed.add(m[0])
+                    if RegisterLocals.write.match(src, m.end()):
+                        modified.add(m[0])
+                if any(name == "ppc_stwcx" for _, _, name, _ in cpu_calls(src)):
+                    modified.update("c->cr[%d]" % i for i in range(4))
+                    accessed.update(modified)
+                if any(RegisterLocals.nonvolatile(m[0]) for m in RegisterLocals.field.finditer(src)):
+                    unsafe.add(start)
+                op, link = w >> 26, w & 1
+                if op in (16, 18):
+                    bits, mask = (26, 0x03FFFFFC) if op == 18 else (16, 0xFFFC)
+                    tgt = (sext(w & mask, bits) + (0 if w & 2 else addr)) & 0xFFFFFFFF
+                    if addr in self.p.import_calls:
+                        if custom_abi(self.p.import_calls[addr][1]):
+                            unsafe.add(start)
+                            blocked.add(start)
+                        else:
+                            accessed.update(import_accessed)
+                            modified.update(import_modified)
+                    elif addr in self.p.undef_calls:
+                        unsafe.add(start)
+                        blocked.add(start)
+                    elif link or not start <= tgt < self.cur_end:
+                        # A nested guest entry can receive a new asynchronous
+                        # preempt request after our caller's partial flush. We
+                        # cannot materialize that ancestor's locals here.
+                        unsafe.add(start)
+                        blocked.add(start)
+                    else:
+                        pending.append(tgt)
+                    # Conditional branches may fall through. Unconditional bc
+                    # (BO=20) cannot; CTR/CR conditions otherwise can.
+                    if link or (op == 16 and ((w >> 21) & 20) != 20):
+                        pending.append(addr + 4)
+                elif op == 19 and ((w >> 1) & 1023) in (16, 528):
+                    xo, bo = (w >> 1) & 1023, (w >> 21) & 31
+                    if link:
+                        unsafe.add(start)  # dynamic callee: no static contract
+                        blocked.add(start)
+                        pending.append(addr + 4)
+                    elif xo == 528:
+                        jt = self.p.jump_tables.get(addr)
+                        if jt:
+                            base, count = jt
+                            pending.extend(base + 4 * i for i in range(count))
+                        # Even a known table has a default external dispatch.
+                        unsafe.add(start)
+                        blocked.add(start)
+                    if (bo & 20) != 20:
+                        pending.append(addr + 4)
+                else:
+                    if any(name in ("ppc_trap", "ppc_unimplemented")
+                           for _, _, name, _ in cpu_calls(src)):
+                        unsafe.add(start)
+                        blocked.add(start)
+                    pending.append(addr + 4)
+            if start not in blocked:
+                inputs = (leaf_inputs([body[a] for a in sorted(body)], modified,
+                                      import_accessed, import_modified)
+                          if self.leaf_read_inputs else frozenset(accessed))
+                contracts[start] = (inputs, frozenset(modified))
+        self.abi_safe = self.entries - unsafe
+        self.abi_calls = frozenset("f_%08X_abi" % e for e in self.abi_safe)
+        self.sync_safe = set(contracts) - self.abi_safe
+        self.call_summaries = {"f_%08X_%s" % (e, "abi" if e in self.abi_safe else "sync"): contract
+                               for e, contract in contracts.items()}
 
     def _imm_overrides(self):
         """Resolve the immediates of instructions referencing imported symbols."""
@@ -140,11 +293,26 @@ class Recompiler:
         if addr in self.p.undef_calls:
             return "ppc_unimplemented(c, 0x%08Xu, 0); /* call to undefined symbol */" % addr
         if tgt in self.entries:
-            return "f_%08X(c);" % tgt
+            suffix = ""
+            if self.abi and self.register_locals:
+                if tgt in self.abi_safe:
+                    suffix = "_abi"
+                elif tgt in self.sync_safe:
+                    suffix = "_sync"
+            return "f_%08X%s(c);" % (tgt, suffix)
         return "c->pc = 0x%08Xu; ppc_dispatch(c);" % tgt
 
     def ret(self):
         return "return;"
+
+    def indirect_call(self, addr):
+        if not (self.register_locals and self.indirect_cache):
+            return "ppc_dispatch(c);"
+        if getattr(self, "icache_in_cpu", True):  # synthetic test instances skip __init__
+            sites = self.__dict__.setdefault("icache_sites", {})
+            site = sites.setdefault(addr, len(sites))
+            return "ppc_dispatch_cached(c, &c->icache[%d]); /* site %08X */" % (site, addr)
+        return "static __thread PpcCallCache ic_%08X; ppc_dispatch_cached(c, &ic_%08X);" % (addr, addr)
 
     def indirect_jump(self, addr):
         jt = self.p.jump_tables.get(addr)
@@ -176,6 +344,54 @@ class Recompiler:
                 self.unhandled[str(e)] += 1
                 s = "ppc_unimplemented(c, 0x%08Xu, 0x%08Xu);" % (a, w)
             body.append((a, w, s))
+        if self.single_precision:
+            body = single_rounds(body, self.sites)
+        if self.flag_liveness:
+            body = dead_flags(body, self.sites)
+        # Include site hooks and the implicit exit in the same synchronization
+        # pass as instructions. Labels remain before hooks, even on backedges.
+        statements = []
+        for a, w, s in body:
+            if a in self.sites:
+                statements.append("site_%08X(c);" % a)
+            statements.append(s)
+        if self.cur_end < self.p.text_hi:
+            # code falling into a hooked function continues with its original code
+            nxt = "f_%08X_orig" % self.cur_end if self.cur_end in self.hooks else "f_%08X" % self.cur_end
+            statements.append("MUSTTAIL return %s(c);" % nxt)
+        else:
+            statements.append("ppc_unimplemented(c, 0x%08Xu, 0); /* fell off end of text */" % self.cur_end)
+        # Explicit packed stores help repeated Cpu observations, but inhibit
+        # Clang's cheaper byte/vector stores in small compare-only leaves.
+        pack_cr_stores = any(a in self.sites or any(RegisterLocals.observer.fullmatch(name)
+                             for _, _, name, _ in cpu_calls(s)) for a, _, s in body)
+        cache = RegisterLocals(statements, abi=self.abi, abi_calls=self.abi_calls,
+                               pack_cr_stores=pack_cr_stores,
+                               call_summaries=self.call_summaries) if self.register_locals else None
+        if cache and self.sync_dataflow:
+            # Labels enter before instruction hooks. Each instruction is a CFG
+            # node; site observers and the implicit exit get their own nodes.
+            by_addr, nodes = {}, []
+            for a, w, s in body:
+                by_addr[a] = len(nodes)
+                if a in self.sites:
+                    nodes.append((None, ""))
+                nodes.append((w, s))
+            nodes.append((None, ""))
+            successors = []
+            for i, (w, s) in enumerate(nodes):
+                edges = {by_addr[int(m[1], 16)] for m in re.finditer(r"goto L_([0-9A-F]{8});", s)
+                         if int(m[1], 16) in by_addr}
+                fall = True
+                if w is not None:
+                    op, xo, bo = w >> 26, (w >> 1) & 1023, (w >> 21) & 31
+                    if op == 18 or (op == 16 and (bo & 20) == 20) or (op == 19 and xo in (16, 528) and (bo & 20) == 20):
+                        fall = bool(w & 1)
+                if fall and i + 1 < len(nodes):
+                    edges.add(i + 1)
+                successors.append(edges)
+            cache.analyze_sync(successors)
+        emitted = iter([cache.emit(s, i) for i, s in enumerate(cache.statements)] if cache else statements)
         # restrict: guest memory never aliases the register file, so the compiler may keep
         # registers in host registers across guest loads/stores
         hooked = start in self.hooks
@@ -184,20 +400,25 @@ class Recompiler:
         if hooked:
             # runtime hook: callers reach hook_X, which may call the original code (f_X_orig)
             out.append("void f_%08X(Cpu* __restrict c) { hook_%08X(c); }\n" % (start, start))
-        out += ["void %s(Cpu* __restrict c) {" % fname, "    PPC_ENTER(0x%08Xu);" % start]
+        fast_entry = self.abi and self.register_locals and start in self.abi_safe | self.sync_safe
+        if fast_entry:
+            suffix = "_abi" if start in self.abi_safe else "_sync"
+            out.append("void %s(Cpu* __restrict c) { PPC_ENTER(0x%08Xu); MUSTTAIL return %s%s(c); }\n" %
+                       (fname, start, fname, suffix))
+            fname += suffix
+        out += ["void %s(Cpu* __restrict c) {" % fname]
+        if not fast_entry:
+            out.append("    PPC_ENTER(0x%08Xu);" % start)
+        if cache:
+            out.extend("    " + s for s in cache.declarations())
         for a, w, s in body:
             if a in self.labels:
                 out.append("L_%08X: ;" % a)
             if a in self.sites:
-                out.append("    site_%08X(c);" % a)
-            out.append("    %s /* %08X: %08X */" % (s, a, w))
+                out.append("    " + next(emitted))
+            out.append("    %s /* %08X: %08X */" % (next(emitted), a, w))
         # fall through into the next function
-        if self.cur_end < self.p.text_hi:
-            # code falling into a hooked function continues with its original code
-            nxt = "f_%08X_orig" % self.cur_end if self.cur_end in self.hooks else "f_%08X" % self.cur_end
-            out.append("    MUSTTAIL return %s(c);" % nxt)
-        else:
-            out.append("    ppc_unimplemented(c, 0x%08Xu, 0); /* fell off end of text */" % self.cur_end)
+        out.append("    " + next(emitted))
         out.append("}")
         return "\n".join(out), len(body)
 
@@ -205,10 +426,13 @@ class Recompiler:
         os.makedirs(outdir, exist_ok=True)
         self.unhandled = collections.Counter()
         self.used_imports = set()
+        self.cached_calls = 0
         self.imm_override = self.imm_override
         files, cur, n = [], [], 0
         for start in self.sorted_entries:
             src, count = self.emit_function(start)
+            self.cached_calls += (src.count("static __thread PpcCallCache") +
+                                  src.count("ppc_dispatch_cached(c, &c->icache["))
             cur.append(src)
             n += count
             if n >= per_file:
@@ -230,6 +454,10 @@ class Recompiler:
             f.write('#pragma once\n#include "ppc.h"\n\n')
             for e in self.sorted_entries:
                 f.write("void f_%08X(Cpu* __restrict c);\n" % e)
+            for e in sorted(self.abi_safe):
+                f.write("void f_%08X_abi(Cpu* __restrict c);\n" % e)
+            for e in sorted(self.sync_safe):
+                f.write("void f_%08X_sync(Cpu* __restrict c);\n" % e)
             f.write("\n/* hooked functions: hook_X is implemented in the runtime, f_X_orig is the game's code */\n")
             for e in sorted(self.hooks):
                 f.write("void f_%08X_orig(Cpu* __restrict c);\nvoid hook_%08X(Cpu* c);\n" % (e, e))
@@ -252,6 +480,7 @@ class Recompiler:
                 f.write('    {0x%08Xu, 0x%08Xu, "%s", "%s", %d, %s},\n' % (s, addr, lib, name, kind == "f", fn))
             f.write("};\nconst unsigned g_recomp_import_count = %d;\n" % len(self.imports))
             f.write("const uint32_t g_recomp_entry_point = 0x%08Xu;\n" % self.p.entry)
+            f.write("const uint32_t g_ppc_icache_sites = %du;\n" % len(self.__dict__.get("icache_sites", {})))
         with open(os.path.join(outdir, "imports.c"), "w") as f:
             f.write('#include "funcs.h"\n\nvoid hle_unimplemented(Cpu* c, const char* lib, const char* name);\n\n')
             for s in func_slots:
@@ -264,15 +493,31 @@ class Recompiler:
     def write_report(self, outdir, nfiles):
         with open(os.path.join(outdir, "report.txt"), "w") as f:
             f.write("functions: %d\nfiles: %d\nfixpoint rounds: %d\n" % (len(self.sorted_entries), nfiles, self.fixpoint_rounds))
+            f.write("register locals: %s\n" % ("on" if self.register_locals else "off"))
+            f.write("single-precision round25 elimination: %s\n" % ("on" if self.single_precision else "off"))
+            f.write("Dead flag elimination: %s\n" % ("on" if self.flag_liveness else "off"))
+            f.write("Leaf input liveness: %s\n" % ("on" if self.leaf_read_inputs and self.abi and self.register_locals else "off"))
+            f.write("ABI synchronization: %s\nABI-safe guest callees: %d\n" %
+                    ("on" if self.abi and self.register_locals else "off", len(self.abi_safe)))
+            f.write("Additional leaf sync callees: %d\n" % len(self.sync_safe))
+            f.write("Sync dataflow: %s\nCached indirect call sites: %d\n" %
+                    ("on" if self.register_locals and self.sync_dataflow else "off", self.cached_calls))
             f.write("imports used: %d of %d\n" % (len(self.used_imports), len(self.imports)))
             f.write("unhandled instruction kinds:\n")
             for k, v in self.unhandled.most_common():
                 f.write("  %6d  %s\n" % (v, k))
-        print(open(os.path.join(outdir, "report.txt")).read())
+        with open(os.path.join(outdir, "report.txt")) as f:
+            print(f.read())
 
 
 if __name__ == "__main__":
     per = 30000
     if "--insns-per-file" in sys.argv:
         per = int(sys.argv[sys.argv.index("--insns-per-file") + 1])
-    Recompiler(sys.argv[1]).run(sys.argv[2], per)
+    Recompiler(sys.argv[1], False if "--no-locals" in sys.argv else None,
+               False if "--no-abi" in sys.argv else None,
+               False if "--no-single-rounds" in sys.argv else None,
+               False if "--no-icache" in sys.argv else None,
+               False if "--no-sync-dataflow" in sys.argv else None,
+               False if "--no-dead-flags" in sys.argv else None,
+               False if "--no-leaf-inputs" in sys.argv else None).run(sys.argv[2], per)

@@ -1,6 +1,8 @@
 // No game assets: assertions inspect data returned by the actual Vulkan device.
 #include "backend.h"
+#include "present.h"
 #include "shaders.h"
+#include "draw_options.h"
 #include "gx2/gx2.h"
 #include "runtime.h"
 #include <algorithm>
@@ -35,7 +37,7 @@ std::vector<uint8_t> read_image(Surface& s,VkImageAspectFlags aspect,uint32_t by
  auto cmd=command_buffer();vkCmdCopyImageToBuffer(cmd,s.image,s.layout,b.buffer,1,&copy);
  VkBufferMemoryBarrier barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};barrier.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_HOST_READ_BIT;barrier.srcQueueFamilyIndex=barrier.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;barrier.buffer=b.buffer;barrier.size=VK_WHOLE_SIZE;
  vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,0,nullptr,1,&barrier,0,nullptr);
- try {flush();std::vector<uint8_t> result(size_t(w)*h*bytes);memcpy(result.data(),b.mapped,result.size());defer_buffer(b);return result;}
+ try {flush_readback();std::vector<uint8_t> result(size_t(w)*h*bytes);memcpy(result.data(),b.mapped,result.size());defer_buffer(b);return result;}
  catch(...){defer_buffer(b);throw;}
 }
 void rgba_is(const std::vector<uint8_t>& data,const uint8_t rgba[4],const char* message) {
@@ -45,6 +47,78 @@ void clear_image(Surface& s,const float rgba[4]) {
  transition_image(&s,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT);
  VkClearColorValue value{};std::copy(rgba,rgba+4,value.float32);VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT,0,s.mips,0,s.arrayLayers};
  vkCmdClearColorImage(command_buffer(),s.image,s.layout,&value,1,&range);mark_gpu_written(&s);
+}
+void surface_pool_check() {
+ if(!draw_option_enabled("WWHD_VK_SURFACE_IMAGE_POOL"))return;
+ wait_idle();reset_surface_image_pool();
+ {
+  Image original(16,16,0x1a);
+  const VkImage image=original.s.image;const VkDeviceMemory memory=original.s.memory;
+  const float green[4]={0,1,0,1},blue[4]={0,0,1,1};
+  const uint8_t blueBytes[4]={0,0,255,255},freshBytes[4]={17,34,51,255};
+  clear_image(original.s,green);
+  destroy_surface_image(&original.s);
+  // A release in the current recording cannot be reissued, even though the
+  // CPU has already dropped its Surface. Its GPU commands have not retired.
+  Image pending(16,16,0x1a);
+  require(pending.s.image!=image&&pending.s.memory!=memory,"surface pool reused an unretired allocation");
+  clear_image(pending.s,blue);
+  const uint64_t serial=recording_submission();flush_async();wait_submission(serial);
+  const uint64_t creates=R.surfaceImageCreates,hits=R.surfaceImagePoolHits;
+  Image reused(16,16,0x1a);
+  require(reused.s.image==image&&reused.s.memory==memory,"surface pool failed fenced image/memory reuse");
+  require(R.surfaceImageCreates==creates&&R.surfaceImagePoolHits==hits+1,"surface pool allocated on a warm hit");
+  require(reused.s.layout==VK_IMAGE_LAYOUT_UNDEFINED,"pooled surface retained content layout");
+  reused.s.addr=mem::host_alloc(65536,256);
+  for(uint32_t i=0;i<65536;++i)mem::ptr(reused.s.addr)[i]=freshBytes[i%4];
+  upload_surface(&reused.s);
+  rgba_is(read_image(reused.s,VK_IMAGE_ASPECT_COLOR_BIT,4),freshBytes,"pooled image showed previous owner's texels");
+  rgba_is(read_image(pending.s,VK_IMAGE_ASPECT_COLOR_BIT,4),blueBytes,"pooled image overwrote a live allocation");
+ }
+ wait_idle();
+ // Alternating allocation classes must warm independently. Mips, layers,
+ // extent, color space and dimensionality all participate in the pool key.
+ auto cycle=[] {
+  Image base(16,16,0x1a),size(32,16,0x1a),mips(16,16,0x1a,false,1,2),
+      layers(16,16,0x1a,false,2),srgb(16,16,0x41a),flat(16,1,0x1a);
+  Surface oneD;oneD.width=16;oneD.height=1;oneD.dim=0;oneD.format=0x1a;oneD.fmt=format_info(oneD.format,false);
+  create_surface_image(&oneD,false);destroy_surface_image(&oneD);
+ };
+ cycle();wait_idle();
+ const uint64_t creates=R.surfaceImageCreates,destroys=R.surfaceImageDestroys;
+ for(unsigned i=0;i<8;++i){cycle();wait_idle();}
+ require(R.surfaceImageCreates==creates&&R.surfaceImageDestroys==destroys,"steady surface allocation classes failed to warm");
+ reset_surface_image_pool();
+ fprintf(stderr,"[renderer smoke] surface pool fence exclusion, fresh upload and allocation-free warm classes passed\n");
+}
+void feedback_image_check() {
+ if(!draw_option_enabled("WWHD_VK_REUSE_FEEDBACK_IMAGES"))return;
+ reset_feedback_images();wait_idle();
+ {
+  Image a(16,16,0x1a),b(32,16,0x1a),c(8,8,0x1a);
+  Surface* sources[3]={&a.s,&b.s,&c.s};
+  Surface* copies[2][3]{};
+  const float green[4]={0,1,0,1};
+  for(auto* source:sources)clear_image(*source,green);
+  for(unsigned stage=0;stage<2;++stage)for(unsigned shape=0;shape<3;++shape)
+   copies[stage][shape]=feedback_image_smoke_snapshot(*sources[shape],stage!=0,0);
+  for(unsigned shape=0;shape<3;++shape)
+   require(copies[0][shape]->image!=copies[1][shape]->image,"VS/PS feedback descriptors share an overwrite slot");
+  const uint64_t creates=R.surfaceImageCreates,destroys=R.surfaceImageDestroys;
+  // Alternate shapes in one texture unit, mutate the source every time and
+  // inspect the actual retained copies. A cache hit must still copy new texels.
+  for(unsigned round=0;round<8;++round)for(unsigned stage=0;stage<2;++stage)for(unsigned shape=0;shape<3;++shape) {
+   const float rgba[4]={float(round&1),float(stage),float(shape&1),1};
+   const uint8_t bytes[4]={uint8_t((round&1)*255),uint8_t(stage*255),uint8_t((shape&1)*255),255};
+   clear_image(*sources[shape],rgba);
+   auto* copy=feedback_image_smoke_snapshot(*sources[shape],stage!=0,0);
+   require(copy==copies[stage][shape],"alternating feedback shape was replaced");
+   rgba_is(read_image(*copy,VK_IMAGE_ASPECT_COLOR_BIT,4),bytes,"feedback reuse skipped a fresh source copy");
+  }
+  require(R.surfaceImageCreates==creates&&R.surfaceImageDestroys==destroys,"warm feedback shapes allocated or destroyed images");
+ }
+ reset_feedback_images();wait_idle();
+ fprintf(stderr,"[renderer smoke] alternating feedback shapes, separate VS/PS slots and fresh copies passed\n");
 }
 void upload_arena_check() {
  const uint64_t before=R.uploadAllocations;
@@ -56,10 +130,10 @@ void upload_arena_check() {
  VkBufferCopy ca{a.offset,0,16},cb{b.offset,16,16};
  auto cmd=command_buffer();vkCmdCopyBuffer(cmd,a.buffer,out.buffer,1,&ca);vkCmdCopyBuffer(cmd,b.buffer,out.buffer,1,&cb);
  VkBufferMemoryBarrier barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};barrier.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_HOST_READ_BIT;barrier.srcQueueFamilyIndex=barrier.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;barrier.buffer=out.buffer;barrier.size=VK_WHOLE_SIZE;
- vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,0,nullptr,1,&barrier,0,nullptr);flush();
+ vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,0,nullptr,1,&barrier,0,nullptr);flush_readback();
  auto bytes=static_cast<uint8_t*>(out.mapped);for(int i=0;i<32;i++)require(bytes[i]==(i<16?0x31:0x72),"arena GPU snapshots corrupted");
  auto reuse=allocate_upload(16,256);require(reuse.buffer==a.buffer&&reuse.offset==a.offset,"arena failed fence reuse");
- require(R.uploadAllocations<=before+1,"arena allocated per slice");defer_buffer(out);command_buffer();flush();
+ require(R.uploadAllocations<=before+1,"arena allocated per slice");defer_buffer(out);command_buffer();flush_readback();
  fprintf(stderr,"[renderer smoke] immutable upload arena GPU snapshots and fence reuse passed\n");
 }
 void asynchronous_submission_check() {
@@ -101,12 +175,26 @@ void asynchronous_submission_check() {
   defer_buffer(temporary);
   flush_async();
  }
+ // Waiting on an earlier readback token must not drain unrelated later work.
+ uint64_t oldest=UINT64_MAX,newest=0;
+ for(const auto& slot:R.submissions)if(slot.pending) {
+  oldest=std::min(oldest,slot.serial);newest=std::max(newest,slot.serial);
+ }
+ require(oldest<newest,"async submits did not retain multiple pending slots");
+ const uint64_t recording=recording_submission();
+ wait_submission(oldest);
+ wait_submission(oldest); // A completed token remains safe to request again.
+ require(recording_submission()==recording,"token wait changed the recording slot");
+ for(const auto& slot:R.submissions) {
+  if(slot.serial==oldest)require(!slot.pending,"token wait failed to retire its submission");
+  if(slot.serial==newest)require(slot.pending,"token wait drained a later submission");
+ }
  VkBufferMemoryBarrier host{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
  host.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;host.dstAccessMask=VK_ACCESS_HOST_READ_BIT;
  host.srcQueueFamilyIndex=host.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;
  host.buffer=out.buffer;host.size=VK_WHOLE_SIZE;
  vkCmdPipelineBarrier(command_buffer(),VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,0,nullptr,1,&host,0,nullptr);
- flush();
+ flush_readback();
  auto* bytes=static_cast<uint8_t*>(out.mapped);
  for(uint32_t submission=0;submission<submissions;++submission)
   for(uint32_t byte=0;byte<payloadSize;++byte) {
@@ -115,9 +203,10 @@ void asynchronous_submission_check() {
    require(bytes[offset+payloadSize]==uint8_t(255-submission*13-byte),"async upload second snapshot differs");
    require(bytes[offset+payloadSize*2]==uint8_t(submission*19+byte),"async deferred temporary copy differs");
   }
+ wait_idle();
  for(const auto& slot:R.submissions)
   require(!slot.pending&&slot.garbageBuffers.empty()&&slot.garbageImages.empty(),"async drain left pending resources");
- defer_buffer(out);flush();
+ defer_buffer(out);flush_readback();
  fprintf(stderr,"[renderer smoke] ten async submissions, immutable snapshots, slot wrap and deferred retirement passed\n");
 }
 void triangle(Surface& s) {
@@ -151,7 +240,7 @@ void triangle(Surface& s) {
  transition_image(&s,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
  VkRenderingAttachmentInfo target{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};target.imageView=layer_view(&s,0);target.imageLayout=s.layout;target.loadOp=VK_ATTACHMENT_LOAD_OP_CLEAR;target.storeOp=VK_ATTACHMENT_STORE_OP_STORE;target.clearValue.color.float32[3]=1;
  VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};ri.renderArea=scissor;ri.layerCount=1;ri.colorAttachmentCount=1;ri.pColorAttachments=&target;
- auto cmd=command_buffer();vkCmdBeginRendering(cmd,&ri);R.rendering=true;vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,objects.pipeline);vkCmdDraw(cmd,3,1,0,0);end_encoder();mark_gpu_written(&s);flush();
+ auto cmd=command_buffer();vkCmdBeginRendering(cmd,&ri);R.rendering=true;vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,objects.pipeline);vkCmdDraw(cmd,3,1,0,0);end_encoder();mark_gpu_written(&s);flush_readback();
  auto pixels=read_image(s,VK_IMAGE_ASPECT_COLOR_BIT,4);
  size_t center=(size_t(s.extent.height/2)*s.extent.width+s.extent.width/2)*4;
  require(pixels[center]==255&&pixels[center+1]==0&&pixels[center+2]==0&&pixels[center+3]==255,"triangle center pixel differs");
@@ -321,7 +410,7 @@ void dynamic_uniform_check(Surface& s) {
    vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,objects.layout,0,2,sets,3,offsets);
    VkRect2D half{{int32_t(draw*s.extent.width/2),0},{s.extent.width/2,s.extent.height}};vkCmdSetScissor(cmd,0,1,&half);vkCmdDraw(cmd,3,1,0,0);
   }
-  end_encoder();mark_gpu_written(&s);flush();
+  end_encoder();mark_gpu_written(&s);flush_readback();
   require(R.submissionGeneration!=generation,"dynamic descriptor pool reset did not change generation");
   auto pixels=read_image(s,VK_IMAGE_ASPECT_COLOR_BIT,4);
   for(uint32_t y=0;y<s.extent.height;++y)for(uint32_t x=0;x<s.extent.width;++x)for(uint32_t channel=0;channel<4;++channel)
@@ -332,7 +421,7 @@ void dynamic_uniform_check(Surface& s) {
 }
 int renderer_smoke_test() {
  try {
-  mem::init();upload_arena_check();asynchronous_submission_check();set_res_scale(1);latch_res_scale();
+  mem::init();upload_arena_check();asynchronous_submission_check();set_res_scale(1);latch_res_scale();surface_pool_check();feedback_image_check();
   {
    Image upload(16,16,0x1a,false,2,2);
    upload.s.addr=mem::host_alloc(65536,256);upload.s.mipAddr=mem::host_alloc(65536,256);
@@ -349,6 +438,15 @@ int renderer_smoke_test() {
    cacheDesc.width=16;cacheDesc.height=16;cacheDesc.pitch=16;cacheDesc.slices=2;
    cacheDesc.mips=2;cacheDesc.format=0x1a;cacheDesc.dim=5;
    auto* cached=find_or_create_surface(cacheDesc,false);
+   require(find_or_create_surface(cacheDesc,false)==cached,"identical guest descriptor missed surface cache");
+   // CPU-owned aliases cannot borrow old content hashes or decode geometry.
+   auto identity=cacheDesc;identity.pitch=32;
+   auto* pitched=find_or_create_surface(identity,false);
+   require(pitched!=cached&&find_or_create_surface(identity,false)==pitched,"guest pitch identity was not retained");
+   identity=cacheDesc;identity.tileMode=1;
+   require(find_or_create_surface(identity,false)!=cached,"guest tile mode was ignored in surface identity");
+   identity=cacheDesc;identity.mipAddr=mem::host_alloc(65536,256);
+   require(find_or_create_surface(identity,false)!=cached,"guest mip address was ignored in surface identity");
    upload_surface(cached);
    uint64_t checks=g_stat_full_checks,uploads=g_stat_uploads;
    upload_surface(cached);
@@ -408,6 +506,14 @@ int renderer_smoke_test() {
    for(size_t i=0;i<stencils.size();++i){float value;memcpy(&value,depths.data()+i*4,4);require(value==0.25f&&stencils[i]==0xa5,"depth/stencil clear differs");}
    fprintf(stderr,"[renderer smoke] depth/stencil upload and clear passed\n");
    Image rendered(64,64,0x1a);dynamic_uniform_check(rendered.s);vertex_window_check(rendered.s);triangle(rendered.s);
+   require(record_signature(0,rendered.s,false),"signature GPU copy could not be recorded");
+   flush_async(); // The signature reader must wait on its recorded token.
+   auto luma=read_signature(0);
+   require(luma.size()==gfx::kSignatureW*gfx::kSignatureH,"signature readback size differs");
+   require(std::abs(luma[(gfx::kSignatureH/2)*gfx::kSignatureW+gfx::kSignatureW/2]-0.299f)<0.002f,
+       "signature readback center differs");
+   reset_signatures();
+   fprintf(stderr,"[renderer smoke] submitted signature fence/readback and deferred reset passed\n");
    if(R.tv.scan)destroy_surface_image(R.tv.scan.get());R.tv.scan=std::make_unique<Surface>();auto& scan=*R.tv.scan;scan.width=64;scan.height=64;scan.format=0x1a;scan.fmt=format_info(scan.format,false);create_surface_image(&scan,false);resample(&rendered.s,&scan,1);mark_gpu_written(&scan);
    auto capturePath=std::filesystem::temp_directory_path()/("wwhd-vulkan-smoke-"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())+".png");
    request_tv_dump(capturePath.string(),0);swap();
@@ -427,11 +533,18 @@ int renderer_smoke_test() {
    size_t pngCenter=32*(64*4+1)+1+32*4;require(decoded[pngCenter]==255&&decoded[pngCenter+1]==0&&decoded[pngCenter+2]==0,"PNG capture triangle center differs");
    fprintf(stderr,"[renderer smoke] queued GPU PNG capture passed: %s\n",capturePath.string().c_str());
    require(R.tv.swapchain!=VK_NULL_HANDLE,"smoke presentation did not create a swapchain");fprintf(stderr,"[renderer smoke] scan-buffer swapchain presentation passed\n");
+   // Wrap submission slots and reacquire swap images in the normal swap path.
+   // WWHD_VK_ASYNC=1 exercises the Switch path on a desktop validation driver.
+   for(uint32_t frame=0;frame<6;++frame) {
+    const float color[4]={float(frame&1),float((frame>>1)&1),0,1};
+    clear_image(scan,color);swap();
+   }
+   fprintf(stderr,"[renderer smoke] repeated frame submission and swap-image semaphore reuse passed\n");
   }
   // Ensure deferred objects left by readback and stack-owned images are actually reclaimed.
-  command_buffer();flush();require(R.garbageBuffers.empty()&&R.garbageImages.empty(),"deferred Vulkan resources were not reclaimed");
+  command_buffer();wait_idle();require(R.garbageBuffers.empty()&&R.garbageImages.empty(),"deferred Vulkan resources were not reclaimed");
   save_pipeline_cache();
   fprintf(stderr,"[renderer smoke] PASS: actual device upload/clear/blit/depth/triangle/present\n");return 0;
- }catch(const std::exception& e){fprintf(stderr,"[renderer smoke] FAIL: %s\n",e.what());try {command_buffer();flush();}catch(...){}return 1;}
+ }catch(const std::exception& e){fprintf(stderr,"[renderer smoke] FAIL: %s\n",e.what());try {command_buffer();wait_idle();}catch(...){}return 1;}
 }
 } // namespace gfxvk

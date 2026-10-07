@@ -17,6 +17,7 @@
 
 #include "../audio_out.h"
 #include "../runtime.h"
+#include "ax_simd.h"
 
 namespace interp { const char* phase_name(); }
 
@@ -173,10 +174,14 @@ void decode(Voice& v, float* out) {
 void apply_envelope(Voice& v, float* s) {
     if (v.ve_vol == 0x8000 && v.ve_delta == 0) return;
     float vol = v.ve_vol / 32768.0f, d = v.ve_delta / 32768.0f;
+#if defined(__SWITCH__) && defined(__aarch64__)
+    axsimd::envelope(s, kSamples, vol, d);
+#else
     for (int i = 0; i < kSamples; i++) {
         vol += d;
         s[i] *= vol;
     }
+#endif
     if (v.ve_delta) v.ve_vol = (uint16_t)std::clamp<int32_t>((int32_t)v.ve_vol + v.ve_delta * kSamples, 0, 0xFFFF);
 }
 
@@ -214,6 +219,10 @@ uint32_t g_sfx_started = 0;
 
 void mix_into(const float* in, float* out, ChMix& m) {
     float vol = m.vol / 32768.0f;
+#if defined(__SWITCH__) && defined(__aarch64__)
+    vol = axsimd::mix(in, out, kSamples, vol, m.delta / 32768.0f);
+    if (m.delta) m.vol = (uint16_t)std::clamp(vol * 32768.0f, 0.0f, 65535.0f);
+#else
     if (m.delta) {
         float d = m.delta / 32768.0f;
         for (int i = 0; i < kSamples; i++) {
@@ -224,13 +233,14 @@ void mix_into(const float* in, float* out, ChMix& m) {
     } else {
         for (int i = 0; i < kSamples; i++) out[i] += in[i] * vol;
     }
+#endif
 }
 
 // debug: WWHD_AX_STATS=1 logs the active voices about once a second
+static bool ax_stats() { static const bool on = getenv("WWHD_AX_STATS") != nullptr; return on; }
 void log_stats() {
-    static bool on = getenv("WWHD_AX_STATS") != nullptr;
     static int frame = 0;
-    if (!on || ++frame % 333) return;
+    if (!ax_stats() || ++frame % 333) return;
     int n = 0, fmt[3] = {}, filt[3] = {}, loops = 0, streams = 0;
     for (Voice& v : g_voices) {
         if (!v.acquired || v.state != 1) continue;
@@ -253,6 +263,7 @@ void log_stats() {
 
 void process_voices() {
     log_stats();
+    const bool stats = ax_stats();
     memset(g_tv_bus, 0, sizeof g_tv_bus);
     float buf[kSamples];
     for (Voice& v : g_voices) {
@@ -261,7 +272,7 @@ void process_voices() {
         apply_envelope(v, buf);
         apply_biquad(v, buf);
         apply_lpf(v, buf);
-        if (v.type == 0) {
+        if (stats && v.type == 0) {
             float tv = 0;
             for (int ch = 0; ch < 2; ch++) tv += v.tv[ch][0].vol / 32768.0f;
             for (int i = 0; i < kSamples; i++) g_sfx_energy += std::fabs(buf[i] / 256.0f) * tv;
@@ -339,6 +350,9 @@ void merge_tv(int32_t out[kTvChannels][kSamples]) {
 
 // 2 -> 3 linear upsampler (Cemu's AXUpsampleLinear32To48)
 void upsample(const int32_t* in, int32_t* out, float& hist, int shift) {
+#if defined(__SWITCH__) && defined(__aarch64__)
+    axsimd::upsample(in, out, kSamples, hist, shift);
+#else
     float prev = hist;
     for (int i = 0; i < kSamples; i += 2) {
         float s0 = (float)in[i], s1 = (float)in[i + 1];
@@ -348,6 +362,7 @@ void upsample(const int32_t* in, int32_t* out, float& hist, int shift) {
         prev = s1;
     }
     hist = prev;
+#endif
 }
 
 void call_final_mix(Cpu* c, int dev, uint32_t param, uint32_t ptrs, uint32_t data, int channels, int devices, int samples) {

@@ -1,5 +1,9 @@
 cmake_minimum_required(VERSION 3.20)
 project(wwhd_recomp C CXX)
+if(NINTENDO_SWITCH)
+  include(${CMAKE_SOURCE_DIR}/cmake/switch.cmake)
+  return()
+endif()
 # Renderers compiled into the executable:
 #   BOTH   (macOS default) Metal and Vulkan (MoltenVK) in one app; Graphics > Renderer picks one at start
 #   METAL  Metal only (macOS)

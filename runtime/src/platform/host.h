@@ -13,6 +13,9 @@
 #endif
 #include <windows.h>
 #include <psapi.h>
+#elif defined(__SWITCH__)
+#include <pthread.h>
+#include <unistd.h>
 #else
 #include <pthread.h>
 #include <sys/mman.h>
@@ -24,9 +27,12 @@
 #include <mach-o/dyld.h>
 #include <climits>
 #include <pthread/qos.h>
-#elif !defined(_WIN32)
+#elif !defined(_WIN32) && !defined(__SWITCH__)
 #include <sys/resource.h>
 #include <sys/syscall.h>
+#endif
+#ifdef __SWITCH__
+extern "C" void _start();  // libnx: first instruction of the program image
 #endif
 namespace host {
 #if defined(__APPLE__) && defined(WWHD_HAS_VULKAN)
@@ -54,6 +60,7 @@ inline void set_thread_name(const char* name) {
  using SetDescription=HRESULT(WINAPI*)(HANDLE,PCWSTR);
  auto f=(SetDescription)GetProcAddress(GetModuleHandleW(L"Kernel32.dll"),"SetThreadDescription");
  if(f) { std::wstring text; for(unsigned char c:thread_label)text.push_back(c); f(GetCurrentThread(),text.c_str()); }
+#elif defined(__SWITCH__)
 #else
  pthread_setname_np(pthread_self(),thread_label.substr(0,15).c_str());
 #endif
@@ -77,7 +84,7 @@ inline void boost_thread_priority() {
   PowerThrottling state{1 /* THREAD_POWER_THROTTLING_CURRENT_VERSION */,1 /* EXECUTION_SPEED */,0 /* off */};
   set_info(GetCurrentThread(),3 /* ThreadPowerThrottling */,&state,sizeof state);
  }
-#else
+#elif !defined(__SWITCH__)  // the Switch places its threads itself (switch_set_helper_thread)
  setpriority(PRIO_PROCESS,(id_t)syscall(SYS_gettid),-5);  // EPERM without CAP_SYS_NICE: ignored
 #endif
 }
@@ -89,11 +96,23 @@ inline void get_thread_name(char* out,size_t size) {
  snprintf(out,size,"%s",thread_label.empty()?"host":thread_label.c_str());
 #endif
 }
+#ifdef __SWITCH__
+extern "C" void switch_set_background_thread();
+#endif
+// Cache writers and other work nobody waits for: run only in time the game and render threads leave
+// idle (Switch: lowest application priority; elsewhere the OS scheduler is left alone).
+inline void background_thread() {
+#ifdef __SWITCH__
+ switch_set_background_thread();
+#endif
+}
 inline uintptr_t executable_base() {
 #ifdef __APPLE__
  return (uintptr_t)&_mh_execute_header;
 #elif defined(_WIN32)
  return (uintptr_t)GetModuleHandleW(nullptr);
+#elif defined(__SWITCH__)
+ return (uintptr_t)&::_start;
 #else
  static int anchor;
  Dl_info info{}; return dladdr(&anchor,&info)?(uintptr_t)info.dli_fbase:0;
@@ -102,6 +121,8 @@ inline uintptr_t executable_base() {
 inline std::string executable_path() {
 #ifdef _WIN32
  char path[32768]; DWORD n=GetModuleFileNameA(nullptr,path,sizeof path);return std::string(path,n);
+#elif defined(__SWITCH__)
+ return "sdmc:/switch/wwhd/wwhd.nro";
 #elif !defined(__APPLE__)
  char path[4096];ssize_t n=readlink("/proc/self/exe",path,sizeof path);return n>0?std::string(path,n):std::string();
 #else
@@ -111,6 +132,8 @@ inline std::string executable_path() {
 inline size_t page_size() {
 #ifdef _WIN32
  SYSTEM_INFO info;GetSystemInfo(&info);return info.dwPageSize;
+#elif defined(__SWITCH__)
+ return 0x1000;
 #else
  return (size_t)getpagesize();
 #endif
@@ -137,6 +160,8 @@ inline bool memory_touched(void* p,size_t bytes) {
 inline bool replace_file(const std::string& from,const std::string& to) {
 #ifdef _WIN32
  return MoveFileExA(from.c_str(),to.c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)!=0;
+#elif defined(__SWITCH__)
+ remove(to.c_str()); return rename(from.c_str(),to.c_str())==0;  // FAT: rename does not replace
 #else
  return rename(from.c_str(),to.c_str())==0;
 #endif
@@ -180,6 +205,8 @@ inline std::string config_dir() {
  const char* home=getenv("HOME");return std::string(home?home:".")+"/Library/Application Support/WWHD";
 #elif defined(_WIN32)
  const char* root=getenv("APPDATA");return std::string(root?root:".")+"/WWHD";
+#elif defined(__SWITCH__)
+ return "sdmc:/switch/wwhd/config";
 #else
  if(const char* xdg=getenv("XDG_CONFIG_HOME"))return std::string(xdg)+"/wwhd";
  const char* home=getenv("HOME");return std::string(home?home:".")+"/.config/wwhd";

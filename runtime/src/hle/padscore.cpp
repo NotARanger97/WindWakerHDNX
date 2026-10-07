@@ -5,6 +5,9 @@
 #include "../runtime.h"
 #include "../input.h"
 #include "../rumble.h"
+#include <cstdio>
+#include <string>
+#include <vector>
 
 namespace interp { bool repeat_input(); bool fresh_sticks(); }
 
@@ -28,6 +31,55 @@ uint32_t pro_buttons(uint32_t v) {
     for (auto& m : map)
         if (v & m[0]) out |= m[1];
     return out;
+}
+// Test aid, Pro Controller input recording (one record per logic-pass read):
+//   WWHD_INPUT_RECORD=path   writes every read (buttons, sticks) to path
+//   WWHD_INPUT_PLAY=path,first   holding L+R+ZL+ZR starts playing path from record `first`; live
+//                                input returns when the recording ends
+struct PadRecord { uint32_t buttons; float lx, ly, rx, ry; };
+input::PadState record_or_play(input::PadState live) {
+    static FILE* rec = [] {
+        const char* e = getenv("WWHD_INPUT_RECORD");
+        FILE* f = e ? fopen(e, "wb") : nullptr;
+        if (f) LOG("[pad] recording input to %s", e);
+        return f;
+    }();
+    static std::vector<PadRecord> play;
+    static size_t next = 0;
+    static int state = [] {  // 0 off, 1 armed, 2 playing, 3 done
+        const char* e = getenv("WWHD_INPUT_PLAY");
+        if (!e) return 0;
+        std::string path(e);
+        size_t first = 0, comma = path.rfind(',');
+        if (comma != std::string::npos) { first = strtoull(path.c_str() + comma + 1, nullptr, 10); path.resize(comma); }
+        if (FILE* f = fopen(path.c_str(), "rb")) {
+            PadRecord r;
+            while (fread(&r, sizeof r, 1, f) == 1) play.push_back(r);
+            fclose(f);
+        }
+        next = first;
+        LOG("[pad] input playback %s: %zu records from %zu (L+R+ZL+ZR starts it)", path.c_str(), play.size(), first);
+        return next < play.size() ? 1 : 0;
+    }();
+    if (rec) {
+        PadRecord r{live.buttons, live.lx, live.ly, live.rx, live.ry};
+        fwrite(&r, sizeof r, 1, rec);
+        static int n = 0;
+        if (++n % 30 == 0) fflush(rec);
+    }
+    constexpr uint32_t kCombo = input::kL | input::kR | input::kZL | input::kZR;
+    if (state == 1 && (live.buttons & kCombo) == kCombo) { state = 2; LOG("[pad] input playback started"); }
+    if (state == 2) {
+        if (next >= play.size()) { state = 3; LOG("[pad] input playback finished"); }
+        else {
+            const PadRecord& r = play[next++];
+            input::PadState p = live;
+            p.buttons = r.buttons; p.lx = r.lx; p.ly = r.ly; p.rx = r.rx; p.ry = r.ry;
+            return p;
+        }
+    }
+    if (state == 1) live.buttons &= ~kCombo;  // the start combo itself never reaches the game
+    return live;
 }
 }  // namespace
 
@@ -73,7 +125,7 @@ HLE(padscore, KPADReadEx) {
     static uint32_t last = 0;
     static input::PadState last_p;
     const bool repeat = interp::repeat_input();
-    input::PadState p = repeat ? last_p : crashrec::read(1);  // see interp.cpp; crash recovery records/replays it
+    input::PadState p = repeat ? last_p : record_or_play(crashrec::read(1));  // see interp.cpp; crash recovery records/replays it
     if (repeat && interp::fresh_sticks()) {  // true 60: sticks every pass, buttons on full passes
         input::PadState f = input::read();
         p.lx = f.lx; p.ly = f.ly; p.rx = f.rx; p.ry = f.ry;

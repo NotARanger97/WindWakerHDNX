@@ -8,6 +8,13 @@ platforms), with no Cemu runtime and no GPU command emulation.
 
 How it works and how it differs from running the game in Cemu: [docs/how-it-works.md](docs/how-it-works.md).
 
+## Nintendo Switch
+
+This fork adds a native **Nintendo Switch** homebrew build (Atmosphère, hbmenu in title takeover
+mode): the same recompiled game on the Switch's ARM cores, graphics on Vulkan through Mesa's NVK
+driver, 30 fps in handheld mode at raised clocks. You build it from your own copy of the game with
+one Docker script. Requirements, building, installing, clocks and status: [docs/switch.md](docs/switch.md).
+
 ## What's new in this update
 
 ### v0.2.3

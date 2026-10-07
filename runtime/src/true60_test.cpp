@@ -1,7 +1,7 @@
 #include <thread>
 #include <chrono>
 #include <atomic>
-#ifndef _WIN32  // the boot-crash debug aids below are POSIX-only (macOS, Linux)
+#if !defined(_WIN32) && !defined(__SWITCH__)  // the boot-crash debug aids below are POSIX-only (macOS, Linux)
 #include <execinfo.h>
 #include <pthread.h>
 #include <signal.h>
@@ -365,7 +365,7 @@ extern "C" void hook_027B8904(Cpu* c) {
 // array's host page is write-protected; every write fault logs the writing thread and backtrace (the
 // page is re-protected 0.2 ms later), to find who corrupts it
 namespace {
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__SWITCH__)
 void wp_arm(uint32_t, uint32_t) { LOG("[wp] WWHD_BOOTDBG_PROT is not available on Windows"); }
 #else
 std::atomic<uintptr_t> g_wp_lo{0}, g_wp_hi{0};
@@ -443,7 +443,7 @@ extern "C" void hook_02753D6C(Cpu* c) {
         std::lock_guard<std::mutex> lk(m);
         if (seen.insert({h, t}).second) {
             char name[64] = "";
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__SWITCH__)
             pthread_getname_np(pthread_self(), name, sizeof name);
 #endif
             LOG("[heaplog] heap %08X (flags %08X, %08X..%08X) first alloc by \"%s\" (%08X) size %X lr %08X", h, ld32(h + 0x90),

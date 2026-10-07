@@ -1,3 +1,6 @@
+#if defined(__SWITCH__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE 1  // newlib: fopencookie
+#endif
 // coreinit FS and nn_save: map Wii U volume paths onto host directories.
 //   /vol/content/...  -> <game>/content/...
 //   /vol/code/...     -> <game>/code/...
@@ -16,6 +19,15 @@
 #include "../runtime.h"
 #include "../write_watch.h"
 #include "../mods/content.h"
+#ifdef __SWITCH__
+extern "C" void switch_dc_store(const void* p, size_t size);  // platform/switch/switch_host.cpp
+#endif
+
+#ifdef __SWITCH__
+#define WWHD_WUA 1
+#include <zarchive/zarchivereader.h>
+#include <vector>
+#endif
 
 namespace {
 
@@ -39,12 +51,118 @@ struct OpenDir {
     std::string path;  // host path
     std::string gpath;
     uint32_t read = 0;  // entries returned so far
+    std::vector<std::pair<std::string, int64_t>> listed;  // .wua directories: name, size (-1 = directory)
 };
 
 std::mutex g_fs_mutex;
 std::unordered_map<uint32_t, OpenFile> g_files;
 std::unordered_map<uint32_t, OpenDir> g_dirs;
 uint32_t g_next_handle = 1;
+
+#ifdef WWHD_WUA
+// ---- the game read straight from a Cemu .wua archive (ZArchive): config::game_dir may name the
+// archive file; <game_dir>/content/... then resolves inside its title folder. Files open as
+// FILE* (fopencookie), so the rest of this file stays the same.
+namespace wua {
+std::mutex g_m;  // ZArchiveReader is not thread-safe
+ZArchiveReader* g_ar = nullptr;
+std::string g_root;  // e.g. "0005000010143600_v0/"
+std::unordered_map<FILE*, uint64_t> g_sizes;
+bool active() {
+    const std::string& g = config::game_dir;
+    if (g.size() < 4 || strcasecmp(g.c_str() + g.size() - 4, ".wua") != 0) return false;
+    std::lock_guard<std::mutex> lk(g_m);
+    if (!g_ar) {
+        g_ar = ZArchiveReader::OpenFromFile(g);
+        if (!g_ar) fatal("cannot open %s", g.c_str());
+        ZArchiveNodeHandle root = g_ar->LookUp("", false, true);
+        ZArchiveReader::DirEntry e;
+        for (uint32_t i = 0; i < g_ar->GetDirEntryCount(root); i++)
+            if (g_ar->GetDirEntry(root, i, e) && e.isDirectory && e.name.find("_v") != std::string_view::npos) {
+                g_root = std::string(e.name) + "/";
+                break;
+            }
+        LOG("[fs] game archive %s, title folder %s", g.c_str(), g_root.c_str());
+    }
+    return true;
+}
+// host path below game_dir -> path inside the archive ("" if not in the archive)
+std::string inner(const std::string& host) {
+    if (!active()) return {};
+    const std::string& g = config::game_dir;
+    if (host.compare(0, g.size(), g) != 0 || host.size() <= g.size() || host[g.size()] != '/') return {};
+    return g_root + host.substr(g.size() + 1);
+}
+struct Cookie { ZArchiveNodeHandle h; uint64_t pos, size; };
+ssize_t c_read(void* p, char* buf, size_t n) {
+    auto* k = (Cookie*)p;
+    std::lock_guard<std::mutex> lk(g_m);
+    uint64_t got = g_ar->ReadFromFile(k->h, k->pos, n, buf);
+    k->pos += got;
+    return (ssize_t)got;
+}
+int c_seek(void* p, off_t* off, int whence) {
+    auto* k = (Cookie*)p;
+    int64_t base = whence == SEEK_SET ? 0 : whence == SEEK_CUR ? (int64_t)k->pos : (int64_t)k->size;
+    int64_t np = base + *off;
+    if (np < 0) return -1;
+    k->pos = (uint64_t)np;
+    *off = np;
+    return 0;
+}
+int c_close(void* p) { delete (Cookie*)p; return 0; }
+// lookup: 1 file, 2 directory, 0 missing
+int kind(const std::string& in, uint64_t* size = nullptr) {
+    std::lock_guard<std::mutex> lk(g_m);
+    ZArchiveNodeHandle h = g_ar->LookUp(in);
+    if (h == ZARCHIVE_INVALID_NODE) return 0;
+    if (g_ar->IsFile(h)) { if (size) *size = g_ar->GetFileSize(h); return 1; }
+    return 2;
+}
+FILE* open(const std::string& in) {
+    ZArchiveNodeHandle h;
+    uint64_t size;
+    {
+        std::lock_guard<std::mutex> lk(g_m);
+        h = g_ar->LookUp(in, true, false);
+        if (h == ZARCHIVE_INVALID_NODE) return nullptr;
+        size = g_ar->GetFileSize(h);
+    }
+    cookie_io_functions_t io{c_read, nullptr, c_seek, c_close};
+    FILE* f = fopencookie(new Cookie{h, 0, size}, "rb", io);
+    if (f) {
+        setvbuf(f, nullptr, _IOFBF, 64 << 10);
+        std::lock_guard<std::mutex> lk(g_m);
+        g_sizes[f] = size;
+    }
+    return f;
+}
+bool size_of(FILE* f, uint64_t& size) {
+    std::lock_guard<std::mutex> lk(g_m);
+    auto it = g_sizes.find(f);
+    if (it == g_sizes.end()) return false;
+    size = it->second;
+    return true;
+}
+void forget(FILE* f) { std::lock_guard<std::mutex> lk(g_m); g_sizes.erase(f); }
+bool list(const std::string& in, std::vector<std::pair<std::string, int64_t>>& out) {
+    std::lock_guard<std::mutex> lk(g_m);
+    ZArchiveNodeHandle h = g_ar->LookUp(in, false, true);
+    if (h == ZARCHIVE_INVALID_NODE) return false;
+    ZArchiveReader::DirEntry e;
+    for (uint32_t i = 0; i < g_ar->GetDirEntryCount(h); i++)
+        if (g_ar->GetDirEntry(h, i, e)) {
+            int64_t sz = -1;
+            if (e.isFile) {
+                ZArchiveNodeHandle fh = g_ar->LookUp(in + "/" + std::string(e.name), true, false);
+                sz = fh == ZARCHIVE_INVALID_NODE ? 0 : (int64_t)g_ar->GetFileSize(fh);
+            }
+            out.emplace_back(std::string(e.name), sz);
+        }
+    return true;
+}
+}  // namespace wua
+#endif
 
 std::string host_path_exact(const std::string& guest) {
     std::string p = guest;
@@ -106,7 +224,7 @@ std::string resolve_case(const std::string& p) {
 #endif
 
 std::string host_path(const std::string& guest) {
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__SWITCH__)
     return host_path_exact(guest);  // Windows file systems are case-insensitive
 #else
     return resolve_case(host_path_exact(guest));
@@ -138,7 +256,14 @@ int32_t open_file(const std::string& gpath, const std::string& mode, uint32_t ou
     if (mode.find_first_of("wa") != std::string::npos) make_parent_dirs(hp);
     std::string m = mode;
     if (m.find('b') == std::string::npos) m += "b";
-    FILE* f = fopen(hp.c_str(), m.c_str());
+    FILE* f = nullptr;
+#ifdef WWHD_WUA
+    if (std::string in = wua::inner(hp); !in.empty()) {
+        if (mode.find_first_of("wa+") != std::string::npos) return FS_ACCESS_ERROR;
+        f = wua::open(in);
+    } else
+#endif
+    f = fopen(hp.c_str(), m.c_str());
     TRACE("[fs] open %s (%s) -> %s", gpath.c_str(), mode.c_str(), f ? "ok" : "not found");
     if (!f) return FS_NOT_FOUND;
     std::lock_guard<std::mutex> lk(g_fs_mutex);
@@ -156,12 +281,36 @@ FILE* file(uint32_t h) {
 
 int32_t stat_path(const std::string& gpath, uint32_t out) {
     struct stat st;
-    if (stat(read_path(gpath).c_str(), &st) != 0) return FS_NOT_FOUND;
+    const std::string path = read_path(gpath);  // a mod's replacement, else the game's file
+#ifdef WWHD_WUA
+    if (std::string in = wua::inner(path); !in.empty()) {
+        uint64_t size = 0;
+        int k = wua::kind(in, &size);
+        if (!k) return FS_NOT_FOUND;
+        memset(&st, 0, sizeof st);
+        st.st_mode = k == 2 ? S_IFDIR : S_IFREG;
+        st.st_size = (off_t)size;
+        fill_stat(out, st);
+        return FS_OK;
+    }
+#endif
+    if (stat(path.c_str(), &st) != 0) return FS_NOT_FOUND;
     fill_stat(out, st);
     return FS_OK;
 }
 
 int32_t open_dir(const std::string& gpath, uint32_t out_handle) {
+#ifdef WWHD_WUA
+    if (std::string in = wua::inner(host_path(gpath)); !in.empty()) {
+        OpenDir od{nullptr, host_path(gpath), gpath};
+        if (!wua::list(in, od.listed)) return FS_NOT_FOUND;
+        std::lock_guard<std::mutex> lk(g_fs_mutex);
+        uint32_t h = g_next_handle++;
+        g_dirs[h] = std::move(od);
+        st32(out_handle, h);
+        return FS_OK;
+    }
+#endif
     DIR* d = opendir(host_path(gpath).c_str());
     TRACE("[fs] opendir %s -> %s", gpath.c_str(), d ? "ok" : "not found");
     if (!d) return FS_NOT_FOUND;
@@ -195,6 +344,9 @@ HLE(coreinit, FSCloseFile) {
     std::lock_guard<std::mutex> lk(g_fs_mutex);
     auto it = g_files.find(arg(c, 2));
     if (it != g_files.end()) {
+#ifdef WWHD_WUA
+        wua::forget(it->second.f);
+#endif
         fclose(it->second.f);
         g_files.erase(it);
     }
@@ -213,6 +365,11 @@ HLE(coreinit, FSReadFile) {
         wwatch::HostWrite w(dst, (uint32_t)std::min<uint64_t>((uint64_t)size * count, 0x100000000ull - dst));
         n = fread(mem::ptr(dst), 1, (size_t)size * count, f);
     }
+#ifdef __SWITCH__
+    // The Wii U reads files by DMA; here the CPU wrote them: clean the cache for the GPU's
+    // in-place reads of MEM2 and announce the pages to the texture watch.
+    switch_dc_store(mem::ptr(dst), n);
+#endif
     ret(c, (uint32_t)(n / size));
 }
 
@@ -239,6 +396,16 @@ HLE(coreinit, FSGetStat) { ret(c, stat_path(mem::read_cstr(arg(c, 2)), arg(c, 3)
 HLE(coreinit, FSGetStatFile) {
     FILE* f = file(arg(c, 2));
     struct stat st;
+#ifdef WWHD_WUA
+    if (uint64_t size; f && wua::size_of(f, size)) {
+        memset(&st, 0, sizeof st);
+        st.st_mode = S_IFREG;
+        st.st_size = (off_t)size;
+        fill_stat(arg(c, 3), st);
+        ret(c, FS_OK);
+        return;
+    }
+#endif
     if (!f || fstat(fileno(f), &st) != 0) { ret(c, FS_NOT_FOUND); return; }
     fill_stat(arg(c, 3), st);
     ret(c, FS_OK);
@@ -251,6 +418,18 @@ HLE(coreinit, FSReadDir) {
     std::lock_guard<std::mutex> lk(g_fs_mutex);
     auto it = g_dirs.find(arg(c, 2));
     if (it == g_dirs.end()) { ret(c, FS_NOT_DIR); return; }
+    if (!it->second.d) {  // .wua directory
+        if (it->second.read >= it->second.listed.size()) { ret(c, FS_END); return; }
+        auto& [name, size] = it->second.listed[it->second.read++];
+        struct stat st;
+        memset(&st, 0, sizeof st);
+        st.st_mode = size < 0 ? S_IFDIR : S_IFREG;
+        st.st_size = size < 0 ? 0 : (off_t)size;
+        fill_stat(out, st);
+        mem::write_cstr(out + 0x64, name.c_str(), 256);
+        ret(c, FS_OK);
+        return;
+    }
     struct dirent* de;
     while ((de = readdir(it->second.d))) {
         if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
@@ -272,7 +451,7 @@ HLE(coreinit, FSCloseDir) {
     std::lock_guard<std::mutex> lk(g_fs_mutex);
     auto it = g_dirs.find(arg(c, 2));
     if (it != g_dirs.end()) {
-        closedir(it->second.d);
+        if (it->second.d) closedir(it->second.d);
         g_dirs.erase(it);
     }
     ret(c, FS_OK);
@@ -372,3 +551,20 @@ void fs_ss_load(ss::Reader& r) {
     }
     g_next_handle = std::max(g_next_handle, next);
 }
+
+#ifdef WWHD_WUA
+// whole file below game_dir, read from the .wua archive (core.cpp's RPX loader); false if not archived
+bool wua_read_file(const std::string& host, std::vector<uint8_t>& out) {
+    std::string in = wua::inner(host);
+    if (in.empty()) return false;
+    FILE* f = wua::open(in);
+    if (!f) return false;
+    uint64_t size = 0;
+    wua::size_of(f, size);
+    out.resize(size);
+    size_t n = fread(out.data(), 1, size, f);
+    wua::forget(f);
+    fclose(f);
+    return n == size;
+}
+#endif

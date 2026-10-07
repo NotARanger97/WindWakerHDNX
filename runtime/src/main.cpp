@@ -1,5 +1,9 @@
 // Wind Waker HD recompiled: entry point.
-#ifndef _WIN32
+#if defined(__SWITCH__)
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#elif !defined(_WIN32)
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -38,7 +42,11 @@ namespace interp { void set_mode(int); }
 #endif
 
 #ifdef WWHD_HAS_VULKAN
-namespace gfxvk { int renderer_smoke_test(); }
+namespace gfxvk {
+int renderer_smoke_test();
+namespace vk { void warm_up_shader_cache(); }
+void warm_up_pipelines();
+}
 #endif
 #ifdef WWHD_HAS_METAL
 int gfx_headstart_warm();  // gfx/shader_headstart.mm
@@ -48,7 +56,12 @@ void mem_setup_heaps(uint32_t data_end);
 void trace_dump(FILE* f, unsigned last);
 void mem_init_data_imports(uint32_t alloc_slot, uint32_t alloc_ex_slot, uint32_t free_slot);
 
-#ifndef _WIN32
+#if defined(__SWITCH__)
+// platform/switch/switch_host.cpp: libnx exception handler (crash log on the SD card)
+void switch_platform_init();
+std::string switch_game_dir();  // platform/switch/switch_host.cpp
+static void install_crash_handler() {}
+#elif !defined(_WIN32)
 // Memory crashes (SIGSEGV/SIGBUS/...): the report goes to the terminal and to
 // captures/crash-<time>.log (registers, guest return chain, host backtrace, crash recovery's
 // automatic state, the last log lines). Only write() and preformatted text after the crash.
@@ -276,6 +289,12 @@ int main(int argc, char** argv) {
     }
 #endif
     bool warm_shaders = false;
+#ifdef __SWITCH__
+    switch_platform_init();  // log file, working directory, crash handler
+    config::game_dir = switch_game_dir();  // WWHD_GAME, a .wua, or sdmc:/switch/wwhd/game
+    config::save_dir = "sdmc:/switch/wwhd/save";
+    fprintf(stderr, "[switch] game: %s\n", config::game_dir.c_str());
+#endif
 #ifdef WWHD_HAS_VULKAN
     bool renderer_smoke = false;
 #endif
@@ -294,7 +313,7 @@ int main(int argc, char** argv) {
     if (getenv("WWHD_TEST_HOST_CRASH")) {
         LOG("[boot] WWHD_TEST_HOST_CRASH: crashing on purpose in the C library");
         size_t (*volatile len)(const char*) = strlen;
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__SWITCH__)
         // the C library's own strlen: zig links its own copy into the executable (Linux releases)
         if (void* f = dlsym(RTLD_DEFAULT, "strlen")) len = (size_t (*)(const char*))f;
 #endif
@@ -361,6 +380,12 @@ int main(int argc, char** argv) {
     // the game runs on its own threads; the process main thread belongs to the window system
     render::init();
     mods::cemu::set_vulkan(render::active()==render::Api::Vulkan);
+#ifdef WWHD_HAS_VULKAN
+    if (render::active() == render::Api::Vulkan) {
+        gfxvk::vk::warm_up_shader_cache();
+        gfxvk::warm_up_pipelines();
+    }
+#endif
     if (warm_shaders) {
         // compile the shader head start once (fills the macOS Metal shader cache), then quit
 #ifdef WWHD_HAS_METAL
