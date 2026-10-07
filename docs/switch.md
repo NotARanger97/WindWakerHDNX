@@ -34,10 +34,24 @@ the `.nro` contains code generated from that copy and must not be shared.
 
 ## Building
 
-### On a PC, without Docker (the builder)
+### The builder program (Windows, recommended)
 
-With the Switch SDK of a release (`sdk-switch/`, it contains no game code) and Python 3.8+ (Windows,
-macOS or Linux):
+**WindWakerHDNX.exe** from the Releases is the whole builder in one file: nothing to install, no
+Python, Docker or devkitPro. Start it, choose your Cemu archive (`.wua`) or the extracted game folder,
+press **Build wwhd.nro** (about 5 minutes; the translated game code never leaves your PC), then
+**Copy to SD card** (it writes `switch/wwhd/wwhd.nro` and `switch/wwhd/Wind Waker HD.wua`). Its files
+live in `%LOCALAPPDATA%\WindWakerHDNX` (delete that folder to remove it; the first start unpacks them,
+about 25 seconds).
+
+Inside: the launcher (`tools/switch/launcher.c`) with a zip of a private Python 3.14 with Tk and
+zig 0.16.0 (both pinned, checksum-verified downloads), the Switch SDK, the recompiler and the window
+(`tools/switch/builder_gui.py`). `python3 tools/switch/package_builder.py --sdk sdk-switch --version V`
+makes it. `.wua` archives are read by `tools/switch/wua.py`.
+
+### On a PC from the source (any OS)
+
+With the Switch SDK of a release (`sdk-switch/`, it contains no game code) and Python 3.8+ (3.14+ for
+`.wua` archives):
 
 ```bash
 python3 tools/switch/builder.py --game /path/to/your/dump --out wwhd.nro

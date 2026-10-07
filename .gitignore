@@ -42,3 +42,4 @@ headstart.bin
 # local coordination board
 /task.md
 /sdk-switch/
+/dist/

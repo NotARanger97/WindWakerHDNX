@@ -12,8 +12,10 @@ How it works and how it differs from running the game in Cemu: [docs/how-it-work
 
 This fork adds a native **Nintendo Switch** homebrew build (Atmosphère, hbmenu in title takeover
 mode): the same recompiled game on the Switch's ARM cores, graphics on Vulkan through Mesa's NVK
-driver, 30 fps in handheld mode at raised clocks. You build it from your own copy of the game with
-one Docker script. Requirements, building, installing, clocks and status: [docs/switch.md](docs/switch.md).
+driver, 30 fps in handheld mode at raised clocks. Download **WindWakerHDNX.exe** from the Releases
+(Windows, nothing to install), choose your own Cemu archive (`.wua`) of the game, press Build (about
+5 minutes) and copy `wwhd.nro` and the game to the SD card with one button. Requirements, installing,
+clocks and status: [docs/switch.md](docs/switch.md).
 
 ## What's new in this update
 
