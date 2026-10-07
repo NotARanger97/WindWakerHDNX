@@ -34,6 +34,30 @@ the `.nro` contains code generated from that copy and must not be shared.
 
 ## Building
 
+### On a PC, without Docker (the builder)
+
+With the Switch SDK of a release (`sdk-switch/`, it contains no game code) and Python 3.8+ (Windows,
+macOS or Linux):
+
+```bash
+python3 tools/switch/builder.py --game /path/to/your/dump --out wwhd.nro
+```
+
+- `--game`: the extracted game (the folder with `code/`, `content/`, `meta/`) or its `code/cking.rpx`.
+  The region (USA or Europe) comes from `meta/meta.xml` (`--region us|eu` otherwise).
+- It translates the game code to C (about 3 minutes), compiles it for the Switch with clang from
+  zig 0.16.0 (downloaded once into the work folder, checksum verified; about 1-2 minutes) and links it
+  with the SDK's prebuilt runtime using zig's lld. No devkitPro, no Docker. A Windows PC took 4 minutes
+  in all.
+- The game code compiled with clang runs as fast as the devkitA64 GCC build (game thread 27.3 ms vs
+  27.9 ms on the hill replay).
+- The SDK: `tools/switch/build.sh --nvk DIR --sdk` (Docker, devkitA64) builds it into `sdk-switch/`: the
+  runtime prelinked with libnx and the C/C++ libraries into one object (`tools/switch/sdk_prelink.py`),
+  libnx's linker script adjusted for lld, and the compile and link flags (`manifest.json`). The NRO
+  packing is `tools/switch/nro.py` (byte-identical to devkitPro's elf2nro and nacptool).
+
+### With Docker (developers)
+
 ```bash
 tools/switch/build.sh --rpx /path/to/game/code/cking.rpx --region us --nvk /path/to/nvk
 ```

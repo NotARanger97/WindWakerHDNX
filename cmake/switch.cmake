@@ -17,16 +17,23 @@ set(PORTLIBS "${DEVKITPRO}/portlibs/switch")
 add_compile_definitions(__SWITCH__)
 set(CPU_FLAGS -mcpu=cortex-a57+crc+crypto)
 
+# WWHD_SWITCH_SDK=ON: no game code and no .nro. Builds the runtime prelinked with libnx and the C/C++
+# libraries into sdk/runtime.o, which the PC builder (tools/switch/builder.py) links with the game code
+# it compiles from the player's own dump (clang and lld from the pinned zig: no devkitPro needed there).
+option(WWHD_SWITCH_SDK "build the Switch SDK for the PC builder instead of the .nro" OFF)
+
 # ---- recompiled game code
-set(GEN_DIR ${CMAKE_SOURCE_DIR}/build/gen CACHE PATH "recompiler output")
-file(GLOB GEN_SOURCES CONFIGURE_DEPENDS ${GEN_DIR}/code_*.c)
-if(NOT GEN_SOURCES)
-  message(FATAL_ERROR "no generated code in ${GEN_DIR}; run tools/recomp/recomp.py first")
+if(NOT WWHD_SWITCH_SDK)
+  set(GEN_DIR ${CMAKE_SOURCE_DIR}/build/gen CACHE PATH "recompiler output")
+  file(GLOB GEN_SOURCES CONFIGURE_DEPENDS ${GEN_DIR}/code_*.c)
+  if(NOT GEN_SOURCES)
+    message(FATAL_ERROR "no generated code in ${GEN_DIR}; run tools/recomp/recomp.py first")
+  endif()
+  add_library(gamecode STATIC ${GEN_SOURCES} ${GEN_DIR}/table.c ${GEN_DIR}/imports.c)
+  target_include_directories(gamecode PUBLIC runtime/include ${GEN_DIR})
+  set(GAMECODE_OPT "-O2" CACHE STRING "optimization level of the recompiled game code (-O2: game thread ~1-2% faster than -O3 on the hill replay, smaller code)")
+  target_compile_options(gamecode PRIVATE ${GAMECODE_OPT} ${CPU_FLAGS} -ffp-contract=off -fno-strict-aliasing -w)
 endif()
-add_library(gamecode STATIC ${GEN_SOURCES} ${GEN_DIR}/table.c ${GEN_DIR}/imports.c)
-target_include_directories(gamecode PUBLIC runtime/include ${GEN_DIR})
-set(GAMECODE_OPT "-O2" CACHE STRING "optimization level of the recompiled game code (-O2: game thread ~1-2% faster than -O3 on the hill replay, smaller code)")
-target_compile_options(gamecode PRIVATE ${GAMECODE_OPT} ${CPU_FLAGS} -ffp-contract=off -fno-strict-aliasing -w)
 
 # ---- vendored Cemu GPU pieces: address library + shader decompiler (GLSL emitter)
 set(CEMU_DIR ${CMAKE_SOURCE_DIR}/runtime/third_party/cemu)
@@ -100,16 +107,39 @@ set(SWITCH_SOURCES runtime/src/platform/switch/sdl_switch.cpp runtime/src/platfo
 # during single-threaded renderer setup or on the render thread itself.
 set_source_files_properties(${GX2_SOURCES} ${GFX_SOURCES} PROPERTIES COMPILE_OPTIONS "-include;${CEMU_DIR}/cemu_shim.h;-fno-threadsafe-statics")
 set_source_files_properties(runtime/src/platform/switch/vk_record_thread.cpp PROPERTIES COMPILE_OPTIONS "-fno-threadsafe-statics")
-add_executable(wwhd ${RUNTIME_SOURCES} ${GX2_SOURCES} ${GFX_SOURCES} ${SWITCH_SOURCES})
-target_include_directories(wwhd PRIVATE runtime/include runtime/src runtime/src/gx2 runtime/src/platform/switch
+add_library(wwhd_runtime OBJECT ${RUNTIME_SOURCES} ${GX2_SOURCES} ${GFX_SOURCES} ${SWITCH_SOURCES})
+target_include_directories(wwhd_runtime PRIVATE runtime/include runtime/src runtime/src/gx2 runtime/src/platform/switch
                                         ${VULKAN_HEADERS} ${SWITCH_MESA_SDK_ROOT}/include ${PORTLIBS}/include
                                         ${glslang_SOURCE_DIR} ${CMAKE_BINARY_DIR}/glslang-inc ${glslang_BINARY_DIR}/include)
-target_compile_definitions(wwhd PRIVATE WWHD_HAS_VULKAN=1 WWHD_SDL_HOST=1)
-target_compile_options(wwhd PRIVATE -O2 ${CPU_FLAGS} -fno-omit-frame-pointer -Wall -Wno-unused-function -Wno-unused-variable -ffp-contract=off)
-target_link_libraries(wwhd PRIVATE gamecode cemu_latte imgui zarchive glslang glslang-default-resource-limits
-  ${SWITCH_MESA_SDK_ROOT}/libnvk_local.o
+target_compile_definitions(wwhd_runtime PRIVATE WWHD_HAS_VULKAN=1 WWHD_SDL_HOST=1)
+target_compile_options(wwhd_runtime PRIVATE -O2 ${CPU_FLAGS} -fno-omit-frame-pointer -Wall -Wno-unused-function -Wno-unused-variable -ffp-contract=off)
+add_dependencies(wwhd_runtime glslang)
+set(RUNTIME_LIBS cemu_latte imgui zarchive glslang glslang-default-resource-limits)
+target_link_libraries(wwhd_runtime PRIVATE ${RUNTIME_LIBS})  # their include directories and definitions
+set(RUNTIME_LIB_FILES ${SWITCH_MESA_SDK_ROOT}/libnvk_local.o
   ${PORTLIBS}/lib/libelf.a ${PORTLIBS}/lib/libexpat.a ${PORTLIBS}/lib/libzstd.a
-  ${PORTLIBS}/lib/libdrm_nouveau.a ${PORTLIBS}/lib/liblz4.a ${PORTLIBS}/lib/libz.a
-  nx m)
-nx_generate_nacp(wwhd.nacp NAME "Wind Waker HD" AUTHOR "ZeldaWWHDRecomp (Switch port)" VERSION "0.1")
-nx_create_nro(wwhd NACP wwhd.nacp)
+  ${PORTLIBS}/lib/libdrm_nouveau.a ${PORTLIBS}/lib/liblz4.a ${PORTLIBS}/lib/libz.a)
+if(WWHD_SWITCH_SDK)
+  # runtime.o: crti/crtbegin, the runtime, its libraries, libnx and newlib/libstdc++/libgcc in one relocatable
+  # object (no debug info); crtend/crtn, the linker script and the headers the game code includes beside it
+  get_filename_component(A64_BIN ${CMAKE_C_COMPILER} DIRECTORY)
+  execute_process(COMMAND ${CMAKE_C_COMPILER} -print-libgcc-file-name OUTPUT_VARIABLE LIBGCC OUTPUT_STRIP_TRAILING_WHITESPACE)
+  get_filename_component(GCC_LIB_DIR ${LIBGCC} DIRECTORY)
+  set(SDK_DIR ${CMAKE_BINARY_DIR}/sdk)
+  set(SDK_LIBS)
+  foreach(lib ${RUNTIME_LIBS})
+    list(APPEND SDK_LIBS $<TARGET_FILE:${lib}>)
+  endforeach()
+  add_custom_command(OUTPUT ${SDK_DIR}/runtime.o
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/switch/sdk_prelink.py
+            --ld ${A64_BIN}/aarch64-none-elf-ld --gcc-lib ${GCC_LIB_DIR} --devkitpro ${DEVKITPRO} --source ${CMAKE_SOURCE_DIR}
+            --out ${SDK_DIR} --libs ${SDK_LIBS} ${RUNTIME_LIB_FILES} --objects $<TARGET_OBJECTS:wwhd_runtime>
+    DEPENDS wwhd_runtime ${RUNTIME_LIBS} ${CMAKE_SOURCE_DIR}/tools/switch/sdk_prelink.py
+    COMMAND_EXPAND_LISTS VERBATIM)
+  add_custom_target(switch_sdk ALL DEPENDS ${SDK_DIR}/runtime.o)
+else()
+  add_executable(wwhd $<TARGET_OBJECTS:wwhd_runtime>)
+  target_link_libraries(wwhd PRIVATE gamecode ${RUNTIME_LIBS} ${RUNTIME_LIB_FILES} nx m)
+  nx_generate_nacp(wwhd.nacp NAME "Wind Waker HD" AUTHOR "ZeldaWWHDRecomp (Switch port)" VERSION "0.1")
+  nx_create_nro(wwhd NACP wwhd.nacp)
+endif()
